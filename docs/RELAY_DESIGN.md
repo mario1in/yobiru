@@ -1,14 +1,23 @@
 # 自托管中继：把 tailnet 搬到 HTTPS 上（设计草案）
 
-**状态：第 1–2 阶段已实现（预览）**：中继服务端、设备登记与信任、帧封装，`/health`、`/info`、`/msg` 与 wake；
-push 与 pull request、响应投递、`request status --refresh`、`request resume`（`relay.py`、`tests/test_relay.py`）。
-第 3–4 阶段尚未实现；在那之前，附件走中继时会被明确拒绝（发送、pull 上传和带文件的结果都是）。部署步骤见
-[RELAY_DEPLOY.zh-CN.md](RELAY_DEPLOY.zh-CN.md)。
+**状态：第 1–3 阶段已实现（预览）**：中继服务端、设备登记与信任、帧封装，`/health`、`/info`、`/msg` 与 wake；
+push 与 pull request、响应投递、`request status --refresh`、`request resume`；消息附件、pull 上传和结果附件
+分块经中继传输，中继按设备限制每日流量（`relay.py`、`tests/test_relay.py`）。第 4 阶段（`onboard`、SPEC、
+真实设备验收记录）尚未完成。部署步骤见 [RELAY_DEPLOY.zh-CN.md](RELAY_DEPLOY.zh-CN.md)。
 
 第 2 阶段的实现：中继帧额外放行 `POST /requests/prepare` 和 `GET /requests/<id>`；发送方的 request 路径经
 `TailscaleRoute` 或 `RelayRoute`（`tailmsg.py`）选择传输，后者用本机当前信任的对方密钥代替 whois 做身份校验；
 接收端维护线程把 push 响应经中继投递给 `NAME.relay` 的发送方。pull request 的发送方身份是 `relay-<kid>` 这个
 StableID，换了密钥就是另一个发送方。
+
+第 3 阶段的实现：每帧最多带 1 MiB 文件内容（`RELAY_PIECE`；两次 base64 和封装后约 1.8 MiB，低于 2 MiB 的帧
+上限）。下载是 `GET /f/<token>/<name>` 加 `Range: bytes=a-b`，写入 `<name>.part`，中断后再 `fetch` 会从已有长度
+继续；上传是 `PUT /requests/<id>/uploads/<token>?offset=N`，按顺序到达，重发同一块会替换该偏移之后的内容，
+跳过偏移返回 409 和已收到的长度，完成文件的那一块校验 SHA-256 并按整份上传的规则提交。中继帧只放行带
+`Range`（不超过一块）的下载和带 `offset` 的上传，整文件不会进入内存。中继每次 poll 应答至多带一个大帧，
+每台设备每个 UTC 日最多转发 `daily_bytes`（默认 8 GiB）密文，按发起请求的一方计：它发出的帧加上它收到的应答；
+超出后返回 `429 quota_exceeded`。没有 `cryptography` 包时，内置 ChaCha20 实现每 MiB 收发两端合计约 2 秒，
+`doctor` 的 `relay-cipher` 会提示。
 本文描述一种新的传输方式：设备只需出站 HTTPS，经过所有者自己托管的中继
 （relay）交换现有的 tailmsg protocol v1 流量。目标场景是同一所有者的设备之间通信，其中一部分设备不能安装
 Tailscale（例如公司电脑）。Tailscale 传输保持不变，仍是默认。
@@ -137,7 +146,7 @@ sh Y relay ping work-mini                                          # 经中继�
 - **发送方认证**：`seal()` 包含发送方静态密钥的 DH，接收方用本机信任的发送方公钥打开，打开成功即证明发送方。
 - **重放**：接收方拒绝 `ts` 偏离本机时间超过 5 分钟的帧，并在 10 分钟内记住已处理的 `frame_id`。
   tailmsg 本身按消息 ID 幂等（重复 `/msg` 返回 200），这一层只是额外防线。
-- **大小**：单帧明文上限 8 MiB。超过的内容（附件下载、pull 上传）按第 7 节分块。
+- **大小**：单帧密文上限 2 MiB。附件下载和 pull 上传按第 7 节分块，每块 1 MiB。
 
 ## 7. 附件
 
@@ -146,7 +155,7 @@ sh Y relay ping work-mini                                          # 经中继�
 
 - URL 主机是 `NAME.relay`，`cmd_fetch()` 据此选中继传输。
 - 接收端 `/f/<token>/<name>` 增加 `Range: bytes=a-b` 支持（Tailscale 下也能用，向后兼容）；
-  中继客户端按 4 MiB 分块拉取，全部到齐后照旧校验 SHA-256。
+  中继客户端按 1 MiB 分块拉取，全部到齐后照旧校验 SHA-256。
 - pull 上传 `PUT /requests/<id>/uploads/<token>` 增加分块上传（`?offset=`，最后一块提交），
   接收端照旧在全部到齐后校验大小和哈希，再返回 201/200。
 - 带宽全部经过中继服务器。中继按设备设每日字节上限，防止失控的 agent 把服务器流量打满。

@@ -29,11 +29,14 @@ DEFAULT_PORT = 7790
 NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 FRAME_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}\Z")
 PATH_RE = re.compile(r"^/[\x21-\x7e]{0,2047}\Z")
-METHODS = ("GET", "POST")           # request uploads (PUT) wait for phase 3
+METHODS = ("GET", "POST", "PUT")
+HEADERS = ("Content-Type", "Range")   # request headers a frame may carry
 MAX_FRAME_BYTES = 2 << 20           # sealed ciphertext per frame
 MAX_BODY_BYTES = MAX_FRAME_BYTES * 2  # JSON request to the relay (base64 and envelope overhead)
 POLL_WAIT_MAX = 25
 POLL_BATCH = 16
+POLL_BYTES = MAX_FRAME_BYTES        # ciphertext per poll answer beyond its first frame
+DAILY_BYTES = 8 << 30               # ciphertext a device may move per UTC day (relay.json "daily_bytes")
 EXCHANGE_TIMEOUT_MAX = 60
 OFFLINE_AFTER = 40                  # seconds without a poll before a device counts as offline
 QUEUE_MAX = 64
@@ -190,9 +193,18 @@ class Registry(object):
 class Hub(object):
     """In-memory routing only. A frame lives while its sender waits; nothing is written to disk."""
 
-    def __init__(self):
+    def __init__(self, daily_bytes=DAILY_BYTES):
         self.cond = threading.Condition()
         self.queues, self.pending, self.seen, self.polling = {}, {}, {}, {}
+        self.daily_bytes, self.usage = daily_bytes, {}
+
+    def used(self, name, add=0):
+        """Ciphertext this device moved today: what it sent, and the answers to its own requests. Caller holds cond."""
+        day = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        seen_day, total = self.usage.get(name, (day, 0))
+        total = (total if seen_day == day else 0) + add
+        self.usage[name] = (day, total)
+        return total
 
     def online(self, name):
         return self.polling.get(name, 0) > 0 or time.monotonic() - self.seen.get(name, -1e9) <= OFFLINE_AFTER
@@ -206,8 +218,12 @@ class Hub(object):
             queue = self.queues.setdefault(target, collections.deque())
             if len(queue) >= QUEUE_MAX:
                 return 429, {"error": "peer_busy"}
+            if self.used(sender) >= self.daily_bytes:
+                print("relay: %s reached its daily limit of %d bytes" % (sender, self.daily_bytes), file=sys.stderr, flush=True)
+                return 429, {"error": "quota_exceeded", "detail": "daily limit of %d bytes; resets at 00:00 UTC" % self.daily_bytes}
+            self.used(sender, len(sealed["ct"]))
             item = (frame_id, sender, sealed)
-            entry = self.pending[frame_id] = {"to": target, "answer": None, "taken": False}
+            entry = self.pending[frame_id] = {"from": sender, "to": target, "answer": None, "taken": False}
             queue.append(item)
             self.cond.notify_all()
             end = time.monotonic() + timeout
@@ -228,8 +244,12 @@ class Hub(object):
                 end = time.monotonic() + wait
                 while not queue and time.monotonic() < end:
                     self.cond.wait(end - time.monotonic())
-                frames = []
+                frames, size = [], 0
                 while queue and len(frames) < POLL_BATCH:
+                    # Keep each answer within what a device reads (MAX_BODY_BYTES): one large frame per poll.
+                    size += len(queue[0][2]["ct"])
+                    if frames and size > POLL_BYTES:
+                        break
                     frame_id, sender, sealed = queue.popleft()
                     self.pending[frame_id]["taken"] = True
                     frames.append({"frame_id": frame_id, "from": sender, "sealed": sealed})
@@ -244,6 +264,7 @@ class Hub(object):
             if entry is None or entry["to"] != name or not entry["taken"] or entry["answer"] is not None:
                 return False
             entry["answer"] = result
+            self.used(entry["from"], len(result[1].get("sealed", {}).get("ct", "")))
             self.cond.notify_all()
             return True
 
@@ -373,7 +394,8 @@ def cmd_server(a):
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(str(home), 0o700)
         registry.create()
-        write_private(home / "relay.json", {"bind": a.bind, "port": a.port, "relay_id": secrets.token_hex(16)})
+        write_private(home / "relay.json", {"bind": a.bind, "port": a.port, "relay_id": secrets.token_hex(16),
+                                            "daily_bytes": int(a.daily_gib * (1 << 30))})
         return {"initialized": str(home), "bind": a.bind, "port": a.port}
     cfg = server_config(home)
     if a.server_cmd == "invite":
@@ -385,7 +407,7 @@ def cmd_server(a):
         if not registry.revoke(check_name(a.name)):
             raise RelayError("unknown_device", a.name)
         return {"revoked": a.name}
-    hub = Hub()
+    hub = Hub(int(cfg.get("daily_bytes", DAILY_BYTES)))
     srv = ThreadingHTTPServer((cfg["bind"], int(cfg["port"])), make_server_handler(registry, hub, cfg["relay_id"]))
     srv.daemon_threads = True
     print(json.dumps({"listening": "http://%s:%d" % srv.server_address[:2]}), flush=True)
@@ -528,7 +550,7 @@ class Device(object):
         req = self.open(frame.get("sealed"), sender, sender_key, frame["frame_id"], "request")
         headers = req.get("headers")
         if (req.get("method") not in METHODS or not isinstance(req.get("path"), str) or not PATH_RE.match(req["path"])
-                or not isinstance(headers, dict) or set(headers) - {"Content-Type"} or
+                or not isinstance(headers, dict) or set(headers) - set(HEADERS) or
                 not all(isinstance(v, str) and len(v) <= 200 and "\r" not in v and "\n" not in v
                         for v in headers.values())):
             raise RelayError("bad_request")
@@ -629,6 +651,8 @@ def main(argv=None):
         if name == "init":
             p.add_argument("--port", type=int, default=DEFAULT_PORT)
             p.add_argument("--bind", default="127.0.0.1")
+            p.add_argument("--daily-gib", type=float, default=DAILY_BYTES / (1 << 30),
+                           help="ciphertext each device may move per UTC day (default %(default)g)")
         if name in ("invite", "revoke"):
             p.add_argument("name")
     p = sp.add_parser("join", help="enroll this device with a one-time invite")

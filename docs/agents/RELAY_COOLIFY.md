@@ -119,6 +119,13 @@ python3 /app/relay.py server devices --relay-home /data
 python3 /app/relay.py server revoke --relay-home /data NAME      # 吊销
 ```
 
+每台设备每个 UTC 日最多经中继转发 8 GiB 密文，超出后报 `quota_exceeded`。用户要求改上限时，在容器里改
+`/data/relay.json` 的 `daily_bytes`（字节数，其他字段不动），再在 Coolify 里重启这个应用：
+
+```sh
+python3 -c 'import json; p = "/data/relay.json"; c = json.load(open(p)); c["daily_bytes"] = 16 << 30; json.dump(c, open(p, "w"))'
+```
+
 ## 5. 向用户汇报
 
 - `RELAY_DOMAIN`，DNS 记录的类型、内容、记录 id，以及是否经 Cloudflare 代理
@@ -129,3 +136,4 @@ python3 /app/relay.py server revoke --relay-home /data NAME      # 吊销
 - 遇到但没有处理的问题
 
 以后的升级：在 Coolify 里重新部署这个应用即可（会拉取 `main` 的最新提交）。需要备份的只有 `/data` 这个卷。
+附件分块（第 3 阶段）改了中继服务端：在这之前部署的中继要重新部署一次，设备才能经它传附件。

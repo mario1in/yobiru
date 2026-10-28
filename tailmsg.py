@@ -85,6 +85,10 @@ def sender_matches(env, ident):
 RELAY_SUFFIX = ".relay"         # devices on a self-hosted relay; Tailscale names with this suffix are refused
 RELAY_ROUTES = {("GET", "/health"), ("GET", "/info"), ("POST", "/msg"), ("POST", "/requests/prepare")}
 RELAY_STATUS_RE = re.compile(r"^/requests/[A-Za-z0-9_-]{8,64}\Z")     # GET: request status for its sender
+RELAY_FILE_RE = re.compile(r"^/f/[^/]+/[^/]+\Z")                       # GET with a Range: one piece of a file
+RELAY_UPLOAD_RE = re.compile(r"^/requests/[A-Za-z0-9_-]{8,64}/uploads/[A-Za-z0-9_-]{32,64}\Z")   # PUT ?offset=
+RELAY_PIECE = 1 << 20           # file bytes per frame: sealed and base64-encoded twice, it stays under 2 MiB
+RELAY_PIECE_TIMEOUT = 60
 _relay = None
 
 
@@ -111,9 +115,16 @@ def relay_ident(name, kid):
             "transport": "relay"}
 
 
-def relay_route(method, path):
-    """What a relay frame may ask of the receiver. Request uploads (PUT) and file downloads wait for phase 3."""
-    return (method, path) in RELAY_ROUTES or (method == "GET" and bool(RELAY_STATUS_RE.match(path)))
+def relay_route(method, target, headers):
+    """What a relay frame may ask of the receiver. Files move one piece per frame, so a whole file never has to
+    fit in memory: downloads name a Range, uploads an offset."""
+    url = urllib.parse.urlparse(target)
+    if (method, url.path) in RELAY_ROUTES or (method == "GET" and RELAY_STATUS_RE.match(url.path)):
+        return True
+    if method == "GET" and RELAY_FILE_RE.match(url.path):
+        span = byte_range(headers.get("Range"), 1 << 62)
+        return bool(span) and headers["Range"].strip()[-1].isdigit() and span[1] - span[0] < RELAY_PIECE
+    return method == "PUT" and bool(RELAY_UPLOAD_RE.match(url.path)) and "offset" in urllib.parse.parse_qs(url.query)
 
 
 def relay_device(ctx):
@@ -1671,6 +1682,22 @@ class ReceiverIdentity(object):
             self.lock.release()
 
 
+def byte_range(header, size):
+    """A single `Range: bytes=A-B` (or `A-`) -> (A, B) inclusive; None without a header; False when unusable."""
+    if header is None:
+        return None
+    match = re.fullmatch(r"bytes=(\d{1,19})-(\d{0,19})", header.strip())
+    if not match:
+        return False
+    start = int(match.group(1))
+    end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+    return (start, end) if start <= end else False
+
+
+UPLOAD_PIECE_MAX = 4 << 20          # one `PUT ...?offset=` piece
+UPLOAD_PIECES_LOCK = threading.Lock()
+
+
 def receiver_identity_error(ctx):
     guard = getattr(ctx, "receiver_identity", None)
     return guard.check() if guard is not None else None
@@ -1802,12 +1829,26 @@ def make_handler(ctx, me):
                 return self.reply(404, {"ok": False, "error": "not found"})
             fp = d / "files" / name
             size = fp.stat().st_size
-            self.send_response(200)
+            span = byte_range(self.headers.get("Range"), size)
+            if span is False:
+                return self.reply(416, {"ok": False, "error": "unsatisfiable range"}, {"Content-Range": "bytes */%d" % size})
+            start, end = span or (0, size - 1)
+            self.send_response(206 if span else 200)
             self.send_header("Content-Type", meta["files"][name].get("mime") or "application/octet-stream")
-            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            if span:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
             self.end_headers()
             with open(fp, "rb") as f:
-                shutil.copyfileobj(f, self.wfile, 1 << 20)
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = f.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
 
         def do_PUT(self):
             match = re.fullmatch(r"/requests/([A-Za-z0-9_-]{8,64})/uploads/([A-Za-z0-9_-]{32,64})",
@@ -1821,6 +1862,9 @@ def make_handler(ctx, me):
             item = pull_upload_manifest(ctx, mid, peer_identity(ident), token)
             if item is None:
                 return self.reply(404, {"ok": False, "error": "upload not found or request already committed"})
+            offsets = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("offset")
+            if offsets is not None:
+                return self.put_piece(mid, token, item, ident, offsets)
             lengths = self.headers.get_all("Content-Length") or []
             if len(lengths) != 1 or self.headers.get("Transfer-Encoding"):
                 return self.reply(411, {"ok": False, "error": "one Content-Length required"})
@@ -1873,6 +1917,72 @@ def make_handler(ctx, me):
                 self.connection.settimeout(old_timeout)
                 if temporary.exists():
                     temporary.unlink()
+
+        def put_piece(self, mid, token, item, ident, offsets):
+            """One piece of an upload (`?offset=N`). Pieces arrive in order; a piece sent again replaces everything
+            from its offset, so a sender that lost an answer just repeats it. The piece that completes the file is
+            verified and committed exactly like a whole upload."""
+            lengths = self.headers.get_all("Content-Length") or []
+            try:
+                offset = int(offsets[0]) if len(offsets) == 1 else -1
+                size = int(lengths[0]) if len(lengths) == 1 else -1
+            except ValueError:
+                offset = size = -1
+            if self.headers.get("Transfer-Encoding") or offset < 0 or size < 0:
+                return self.reply(411, {"ok": False, "error": "one offset and one Content-Length required"})
+            if offset + size > item["size"] or size > UPLOAD_PIECE_MAX:
+                self.close_connection = True
+                return self.reply(413, {"ok": False, "error": "piece exceeds the manifest size or %d bytes" % UPLOAD_PIECE_MAX})
+            old_timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(30)
+                data = self.rfile.read(size)
+            except OSError:
+                data = b""
+            finally:
+                self.connection.settimeout(old_timeout)
+            if len(data) != size:
+                self.close_connection = True
+                return self.reply(400, {"ok": False, "error": "incomplete upload"})
+            directory = ctx.home / "requests" / "uploads" / mid
+            private_mkdir(directory)
+            destination, partial = directory / token, directory / (token + ".partial")
+            done = {"ok": True, "id": mid, "token": token, "sha256": item["sha256"], "size": item["size"]}
+            with UPLOAD_PIECES_LOCK:
+                if destination.is_file():
+                    return self.reply(200, done)
+                have = partial.stat().st_size if partial.is_file() else 0
+                if offset > have:
+                    return self.reply(409, {"ok": False, "error": "upload continues at offset %d" % have, "received": have})
+                if offset == 0:
+                    stream = private_open(partial, truncate=True)
+                else:
+                    stream = os.fdopen(os.open(str(partial), os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)), "wb")
+                with stream:
+                    stream.seek(offset)
+                    stream.truncate(offset)
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if offset + size < item["size"]:
+                    return self.reply(202, {"ok": True, "id": mid, "token": token, "received": offset + size})
+                if sha256_file(partial) != item["sha256"]:
+                    partial.unlink()
+                    return self.reply(400, {"ok": False, "error": "upload sha256 mismatch"})
+                # Recheck local identity, peer access and reservation before the upload counts, as for a whole one.
+                if not self.check_receiver_identity():
+                    return
+                try:
+                    current = self.lookup_peer(fresh=True)
+                except TailscaleUnavailable:
+                    return self.reply(503, {"ok": False, "error": "identity lookup unavailable",
+                                            "code": "identity_unavailable"}, {"Retry-After": "1"})
+                if (not current or peer_identity(current) != peer_identity(ident) or not ctx.access_decision(current)[0] or
+                        pull_upload_manifest(ctx, mid, peer_identity(current), token) != item):
+                    return self.reply(409, {"ok": False, "error": "upload authorization or request state changed"})
+                os.replace(partial, destination)
+                sync_directory(directory)
+                return self.reply(201, done)
 
         def do_POST(self):
             route = urllib.parse.urlparse(self.path).path
@@ -2932,15 +3042,14 @@ def relay_frame(ctx, device, handler, frame, slots):
             log("relay frame refused:", exc)
             device.refuse(frame.get("frame_id") if isinstance(frame, dict) else None, exc.code)
             return
-        route = (request["method"], urllib.parse.urlparse(request["path"]).path)
-        if relay_route(*route):
+        if relay_route(request["method"], request["path"], request["headers"]):
             h = handler(request, sender, sender_key)
             h.handle_one_request()
             head, _, body = h.wfile.getvalue().partition(b"\r\n\r\n")
             lines = head.decode("latin-1").split("\r\n")
             status = int(lines[0].split()[1]) if lines[0] else 502
             headers = {k.strip(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])
-                       if k.strip().lower() == "content-type"}
+                       if k.strip().lower() in ("content-type", "content-range")}
         else:
             status, headers = 404, {"Content-Type": "application/json"}
             body = json.dumps({"ok": False, "error": "not carried over the relay"}).encode()
@@ -2987,6 +3096,15 @@ def relay_http_json(device, to_fqdn, method, path, body=None, timeout=15):
         return status, json.loads(raw)
     except Exception:
         return status, {"raw": raw[:200].decode("utf-8", "replace")}
+
+
+def relay_exchange(device, peer, method, path, body=b"", headers=None, timeout=RELAY_PIECE_TIMEOUT):
+    """One raw exchange with a relay device -> (status, headers, body bytes); TransportError on failure."""
+    relay = relay_module()
+    try:
+        return device.exchange(device.canonical(peer), method, path, body, headers or {}, timeout=timeout)
+    except relay.RelayError as exc:
+        raise TransportError("relay %s %s to %s failed: %s" % (method, path.split("?")[0], peer, exc)) from exc
 
 
 class TailscaleRoute(object):
@@ -3270,6 +3388,8 @@ def upload_request_file(ctx, env, item, route):
     # Hashing a large snapshot takes time: check the pinned destination again right before connecting, so a
     # private input never goes to whoever holds the address now.
     verify_pull_destination(ctx, env, route)
+    if route.transport == "relay":
+        return upload_relay_pieces(env, item, route, source)
     connection = http.client.HTTPConnection(ip, port, timeout=30)
     try:
         with open(source, "rb") as stream:
@@ -3290,6 +3410,37 @@ def upload_request_file(ctx, env, item, route):
         raise TransportError(transport_diagnostic(peer, ip, port, "request attachment upload", exc)) from exc
     finally:
         connection.close()
+
+
+def upload_relay_pieces(env, item, route, source):
+    """upload_request_file() through the relay: `PUT ...?offset=` one piece per frame. A piece whose answer was
+    lost is sent again; the receiver replaces what followed its offset."""
+    path = "/requests/%s/uploads/%s" % (env["id"], item["token"])
+    offset, body = 0, None
+    with open(source, "rb") as stream:
+        while True:
+            piece = stream.read(RELAY_PIECE)
+            for attempt in range(3):
+                try:
+                    status, _, raw = relay_exchange(route.device, route.peer, "PUT", "%s?offset=%d" % (path, offset),
+                                                    piece, {"Content-Type": "application/octet-stream"})
+                    break
+                except TransportError:
+                    if attempt == 2:
+                        raise
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                body = None
+            if not isinstance(body, dict) or body.get("ok") is not True or body.get("token") != item["token"]:
+                break
+            if status == 202 and body.get("received") == offset + len(piece) and piece:
+                offset += len(piece)
+                continue
+            break
+    if (status not in (200, 201) or not isinstance(body, dict) or body.get("id") != env["id"] or
+            body.get("sha256") != item["sha256"] or body.get("size") != item["size"]):
+        raise RuntimeError("request attachment upload not confirmed (HTTP %s)" % status)
 
 
 def verify_pull_destination(ctx, env, route):
@@ -3352,9 +3503,7 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     tracked = a.kind == "request" and not getattr(a, "legacy_request", False)
     pull = getattr(a, "transport", "push") == "pull"
     if is_relay_name(host):
-        # A relay device: no Tailscale lookup at all. Attachments wait for phase 3 (docs/RELAY_DESIGN.md).
-        if getattr(a, "file", None):
-            die("attachments are not carried over a relay yet")
+        # A relay device: no Tailscale lookup at all (docs/RELAY_DESIGN.md).
         device = relay_device(ctx)
         route = RelayRoute(ctx, device.canonical(host) + RELAY_SUFFIX, device)
     else:
@@ -3597,6 +3746,10 @@ def cmd_fetch(ctx, a):
             if dst.is_file() and sha256_file(dst) == f["sha256"]:
                 print("OK    %s (already fetched)" % name)
                 continue
+            if is_relay_name(sender):
+                fetch_relay_file(ctx, env, f, u.path, sender, dst)
+                print("OK    %s  %d bytes  sha256 verified -> %s" % (name, f["size"], dst))
+                continue
             _, ip = ctx.resolve(u.hostname)
             if not is_tailnet_ip(ip):
                 raise RuntimeError("resolved to non-tailnet ip %s" % ip)
@@ -3644,6 +3797,42 @@ def cmd_fetch(ctx, a):
             print("FAIL  %s  %s" % (name, e))
     if not ok:
         sys.exit(2)
+
+
+def fetch_relay_file(ctx, env, f, path, sender, dst):
+    """cmd_fetch() from a relay device: one Range per frame into DST.part, which a later fetch continues."""
+    device = relay_device(ctx)
+    if env.get("response") and env.get("reply_to"):
+        with request_db(ctx) as db:
+            original = request_row(db, "outgoing", env["reply_to"])
+        if original and is_pull_request(json.loads(original["envelope"])):
+            ident = relay_peer_ident(device, sender)
+            pinned = json.loads(original["record"] or "{}").get("peer_identity")
+            if not ident or pinned != peer_identity(ident) or not ctx.access_decision(ident)[0]:
+                raise RuntimeError("result attachment destination identity or authorization changed")
+    part, digest = dst.with_name(dst.name + ".part"), hashlib.sha256()
+    have = part.stat().st_size if part.is_file() and not part.is_symlink() else 0
+    if have > f["size"]:
+        have = 0
+    if have:
+        with open(part, "rb") as reader:
+            for chunk in iter(lambda: reader.read(1 << 20), b""):
+                digest.update(chunk)
+    with (os.fdopen(os.open(str(part), os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)), "ab") if have
+          else private_open(part, truncate=True)) as writer:
+        while have < f["size"]:
+            end = min(f["size"], have + RELAY_PIECE) - 1
+            status, _, body = relay_exchange(device, sender, "GET", path, b"", {"Range": "bytes=%d-%d" % (have, end)})
+            if status != 206 or len(body) != end - have + 1:
+                raise RuntimeError("HTTP %d %s" % (status, body[:200].decode("utf-8", "replace")))
+            digest.update(body)
+            writer.write(body)
+            writer.flush()
+            have += len(body)
+    if digest.hexdigest() != f["sha256"]:
+        part.unlink()
+        raise RuntimeError("sha256/size mismatch - discarded")
+    os.replace(part, dst)
 
 
 def staged_result_referenced(ctx, request_id, token, since_seq=None):
@@ -3696,8 +3885,6 @@ def respond_with_files(ctx, rec, a, state):
     snapshot = request_snapshot(ctx.home, original["id"])
     if not snapshot:
         raise ValueError("no tracked incoming request with this ID")
-    if a.file and rec["received"]["peer"].get("transport") == "relay":
-        raise ValueError("attachments are not carried over a relay yet; reply with text only")
     envelope = {"id": original["id"], "from": snapshot["response"]["from"]}
     staged = prepare_attachments(ctx, a, envelope, rec["received"]["peer"]["node"],
                                  persistent_request=original["id"] if is_pull_request(original) else None)

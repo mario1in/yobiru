@@ -6,6 +6,7 @@ whose PATH has no tailscale at all. Nothing here touches the real Tailscale, por
 machine.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -54,7 +55,7 @@ class RelayUnitTests(unittest.TestCase):
         self.root = Path(temp.name)
         self.server_home = self.root / "relay"
         relay.cmd_server(argparse.Namespace(relay_home=str(self.server_home), server_cmd="init", bind="127.0.0.1",
-                                            port=0))
+                                            port=0, daily_gib=8))
         self.registry = relay.Registry(self.server_home)
         cfg = relay.server_config(self.server_home)
         self.hub = relay.Hub()
@@ -181,6 +182,26 @@ class RelayUnitTests(unittest.TestCase):
             self.assertIn(c.getresponse().status, (401, 413))
             c.close()
 
+    def test_a_poll_answer_holds_at_most_one_large_frame(self):
+        def queue(frame_id, size):
+            self.hub.queues.setdefault("bravo", relay.collections.deque()).append((frame_id, "alpha", {"ct": "x" * size}))
+            self.hub.pending[frame_id] = {"from": "alpha", "to": "bravo", "answer": None, "taken": False}
+        for i in range(3):
+            queue("large-frame-%010d" % i, relay.MAX_FRAME_BYTES * 4 // 3)
+        for i in range(3):
+            queue("small-frame-%010d" % i, 1000)
+        sizes = [len(self.hub.poll("bravo", 0)) for _ in range(4)]
+        self.assertEqual([1, 1, 1, 3], sizes)
+
+    def test_a_device_over_its_daily_limit_is_refused(self):
+        self.hub.daily_bytes = 1
+        self.hub.seen["bravo"] = time.monotonic()           # online, but never answers
+        self.refused("peer_timeout", self.dev["alpha"].exchange, "bravo", "GET", "/health", b"", None, 1)
+        error = self.refused("quota_exceeded", self.dev["alpha"].exchange, "bravo", "GET", "/health")
+        self.assertFalse(error.unknown)
+        self.hub.usage["alpha"] = ("2000-01-01", 10 ** 12)  # a new UTC day starts from zero
+        self.refused("peer_timeout", self.dev["alpha"].exchange, "bravo", "GET", "/health", b"", None, 1)
+
     def test_only_https_or_loopback_http(self):
         self.assertEqual("https://relay.example.com", relay.check_url("https://relay.example.com/"))
         self.assertEqual("http://127.0.0.1:7790", relay.check_url("http://127.0.0.1:7790"))
@@ -203,6 +224,24 @@ class TailmsgRelayIdentityTests(unittest.TestCase):
         self.assertEqual((True, "allowlist"), core.access_decision({"allow": ["alpha.relay"]}, ident))
         self.assertEqual((False, "not_allowed"), core.access_decision({"allow": ["bravo.relay"]}, ident))
         self.assertTrue(core.access_decision({"allow": [core.peer_identity(ident)]}, ident)[0])
+
+    def test_relay_frames_move_files_one_piece_at_a_time(self):
+        piece = "bytes=0-%d" % (core.RELAY_PIECE - 1)
+        self.assertTrue(core.relay_route("GET", "/f/tok/a.bin", {"Range": piece}))
+        for headers in ({}, {"Range": "bytes=0-"}, {"Range": "bytes=0-%d" % core.RELAY_PIECE}, {"Range": "bytes=5-1"}):
+            self.assertFalse(core.relay_route("GET", "/f/tok/a.bin", headers), headers)
+        upload = "/requests/0123456789abcdef/uploads/" + "t" * 43
+        self.assertTrue(core.relay_route("PUT", upload + "?offset=0", {}))
+        self.assertFalse(core.relay_route("PUT", upload, {}))
+        self.assertTrue(core.relay_route("GET", "/requests/0123456789abcdef", {}))
+        self.assertFalse(core.relay_route("POST", "/f/tok/a.bin", {}))
+
+    def test_byte_ranges(self):
+        self.assertIsNone(core.byte_range(None, 10))
+        self.assertEqual((2, 9), core.byte_range("bytes=2-", 10))
+        self.assertEqual((0, 9), core.byte_range("bytes=0-99", 10))
+        for header in ("bytes=10-12", "bytes=3-1", "bytes=-5", "bytes=0-1,4-5", "items=0-1"):
+            self.assertIs(False, core.byte_range(header, 10), header)
 
     def test_config_relay_mode_is_validated(self):
         self.assertEqual("only", core.parse_config({"relay": "only"})[0]["relay"])
@@ -393,18 +432,28 @@ class RelayLoopbackTests(unittest.TestCase):
     def status(self, who, mid, *extra):
         return self.tm_json(who, "request", "status", mid, "--json", *extra)
 
-    def test_2_info_advertises_requests_and_attachments_are_still_refused(self):
+    def big_file(self, name):
+        """A file of two relay pieces -> (path, sha256)."""
+        data = os.urandom(core.RELAY_PIECE + 4096)
+        path = self.pkg.root / name
+        path.write_bytes(data)
+        return path, hashlib.sha256(data).hexdigest()
+
+    def fetched(self, who, mid, name):
+        r = self.tm(who, "fetch", mid)
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        return hashlib.sha256((self.home[who] / "inbox" / mid / "files" / name).read_bytes()).hexdigest()
+
+    def test_2_a_message_attachment_is_fetched_through_the_relay(self):
         info = self.run_json(["--home", str(self.home["alpha"]), "relay", "info", "bravo"])
         self.assertEqual((200, "bravo.relay"), (info["status"], info["response"]["node"]))
         self.assertLessEqual({"request-lifecycle-v1", "request-pull-v1"}, set(info["response"]["capabilities"]))
-        before = len(self.inbox("bravo"))
-        report = self.pkg.root / "notes.txt"
-        report.write_text("notes")
-        for args in (("send", "bravo.relay", "with a file"), ("request", "send", "bravo.relay/codex", "with a file")):
-            r = self.tm("alpha", *(args + ("--file", str(report))))
-            self.assertNotEqual(0, r.returncode)
-            self.assertIn("attachments are not carried", r.stderr)
-        self.assertEqual(before, len(self.inbox("bravo")))
+        path, digest = self.big_file("notes.bin")
+        out = self.tm_json("alpha", "send", "bravo.relay", "with a file", "--file", str(path))
+        self.assertEqual((202, 1), (out["status"], out["files"]))
+        self.assertEqual(digest, self.fetched("bravo", out["id"], "notes.bin"))
+        checks = {c["check"]: c for c in json.loads(self.tm("bravo", "doctor", "--json").stdout)["checks"]}
+        self.assertIn(checks["relay-cipher"]["status"], ("ok", "info"))      # which cipher moves the pieces
 
     def test_3_untrusting_a_sender_refuses_its_next_message(self):
         before = len(self.inbox("bravo"))
@@ -430,32 +479,33 @@ class RelayLoopbackTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: self.status("alpha", mid)["state"] == "received", timeout=20))
         self.tm_json("bravo", "request", "respond", mid, "started", "--state", "running")
         self.assertTrue(wait_for(lambda: self.status("alpha", mid)["state"] == "running", timeout=20))
-        report = self.pkg.root / "results.txt"
-        report.write_text("all green")
-        r = self.tm("bravo", "reply", mid, "see the file", "--file", str(report))
-        self.assertNotEqual(0, r.returncode)
-        self.assertIn("attachments are not carried", r.stderr)
-        self.assertTrue(self.tm_json("bravo", "reply", mid, "all green")["queued"])
+        report, digest = self.big_file("results.bin")
+        self.assertTrue(self.tm_json("bravo", "reply", mid, "all green", "--file", str(report))["queued"])
         self.assertTrue(wait_for(lambda: self.status("alpha", mid)["state"] == "completed", timeout=20))
         done = self.status("alpha", mid, "--refresh")
         self.assertEqual(("ok", "completed", "all green", True),
                          (done["refresh"], done["state"], done["response"]["text"], done["outcome_known"]))
+        self.assertEqual(digest, self.fetched("alpha", done["response"]["id"], "results.bin"))
 
     def test_5_a_pull_request_result_waits_for_refresh(self):
+        logs, logs_digest = self.big_file("logs.bin")
         out = self.tm_json("alpha", "request", "send", "bravo.relay/codex", "summarise the logs",
-                           "--transport", "pull")
-        self.assertEqual((202, "accepted", "pull"), (out["status"], out["submission"], out["transport"]))
+                           "--transport", "pull", "--file", str(logs))
+        self.assertEqual((202, "accepted", "pull", 1), (out["status"], out["submission"], out["transport"], out["files"]))
         mid = out["id"]
         kid = relay.fingerprint_kid(self.run_json(["--home", str(self.home["alpha"]), "relay", "whoami"])["fingerprint"])
         owner = "node:" + ("relay-" + kid).encode("ascii").hex()
         self.assertEqual(owner, self.status("bravo", mid, "--direction", "incoming")["peer"])
         resumed = self.tm_json("alpha", "request", "resume", mid)      # the same request again: a duplicate
         self.assertEqual((200, "accepted"), (resumed["status"], resumed["submission"]))
-        self.assertTrue(self.tm_json("bravo", "reply", mid, "three warnings")["stored"])
+        self.assertEqual(logs_digest, self.fetched("bravo", mid, "logs.bin"))   # uploaded before the commit
+        summary, summary_digest = self.big_file("summary.bin")
+        self.assertTrue(self.tm_json("bravo", "reply", mid, "three warnings", "--file", str(summary))["stored"])
         self.assertNotIn(self.status("alpha", mid)["state"], ("received", "completed"))   # nothing is pushed
         done = self.status("alpha", mid, "--refresh")
         self.assertEqual(("ok", "completed", "three warnings"),
                          (done["refresh"], done["state"], done["response"]["text"]))
+        self.assertEqual(summary_digest, self.fetched("alpha", done["response"]["id"], "summary.bin"))
         # A sender whose key bravo no longer trusts cannot read the status, even with the request ID.
         self.run_ok(["--home", str(self.home["bravo"]), "relay", "untrust", "alpha"])
         try:
@@ -465,6 +515,35 @@ class RelayLoopbackTests(unittest.TestCase):
         finally:
             fp = self.run_json(["--home", str(self.home["alpha"]), "relay", "whoami"])["fingerprint"]
             self.run_ok(["--home", str(self.home["bravo"]), "relay", "trust", "alpha", "--fingerprint", fp])
+
+    def test_6_upload_pieces_may_repeat_but_never_skip(self):
+        device = core.relay_module().Device(self.home["alpha"])
+        data = os.urandom(core.RELAY_PIECE + 1000)
+        first, rest = data[:core.RELAY_PIECE], data[core.RELAY_PIECE:]
+        mid, token = core.secrets.token_hex(8), core.secrets.token_urlsafe(32)
+        item = {"token": token, "name": "raw.bin", "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+                "mime": "application/octet-stream"}
+        env = {"v": 1, "id": mid, "from": core.stable_peer_id("relay-" + device.kid), "to": "bravo.relay",
+               "ts": core.iso(core.now_utc()), "kind": "request", "text": "raw upload",
+               "request": {"timeout_seconds": 600, "reply_port": 7766, "transport": "pull", "uploads": [item]}}
+        status, prepared = core.relay_http_json(device, "bravo.relay", "POST", "/requests/prepare", env)
+        self.assertEqual(201, status, prepared)
+
+        def put(offset, piece):
+            status, _, body = core.relay_exchange(device, "bravo.relay", "PUT", "/requests/%s/uploads/%s?offset=%d"
+                                                  % (mid, token, offset), piece, {"Content-Type": "application/octet-stream"})
+            return status, json.loads(body)
+        for _ in range(2):                                   # the answer was lost: the same piece again
+            self.assertEqual((202, core.RELAY_PIECE), (lambda r: (r[0], r[1]["received"]))(put(0, first)))
+        status, body = put(core.RELAY_PIECE + 5, rest[:10])                         # a gap
+        self.assertEqual((409, core.RELAY_PIECE), (status, body["received"]))
+        self.assertEqual(413, put(core.RELAY_PIECE, rest + b"!")[0])                # past the manifest size
+        self.assertEqual(400, put(core.RELAY_PIECE, rest[:-1] + b"x")[0])        # wrong bytes: start again
+        self.assertEqual(409, put(core.RELAY_PIECE, rest)[0])
+        self.assertEqual(202, put(0, first)[0])
+        self.assertEqual(201, put(core.RELAY_PIECE, rest)[0])
+        self.assertEqual(200, put(core.RELAY_PIECE, rest)[0])                     # already complete
+        self.assertEqual(data, (self.home["bravo"] / "requests" / "uploads" / mid / token).read_bytes())
 
 
 if __name__ == "__main__":

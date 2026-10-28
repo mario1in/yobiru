@@ -1,4 +1,4 @@
-# 自托管中继部署手册（预览，第 1–2 阶段）
+# 自托管中继部署手册（预览，第 1–3 阶段）
 
 本手册把[中继](RELAY_DESIGN.md)部署到你自己的设备上：一台有公网域名的服务器运行中继；公司 Mac 只走中继，
 不装 Tailscale；Grok bot 的电脑和家里的 Mac mini 同时保留 Tailscale。完成后，Grok bot 可以给公司 Mac 上的
@@ -8,8 +8,8 @@ Codex 的回复会原路回来。
 交给 agent 执行的版本：[Coolify 部署中继](agents/RELAY_COOLIFY.md)、[更新 Grok Bot](agents/RELAY_GROK_UPDATE.md)、
 [安装公司 Mac](agents/RELAY_WORK_MAC.md)。容器镜像见 `deploy/relay/Dockerfile`。
 
-**中继还不转发附件。** 消息、wake、tracked request（push 和 pull）都能走中继；带 `--file` 的发送和带附件的
-结果会被明确拒绝，要等第 3 阶段。在公司电脑上运行之前，请先确认这符合公司的规定。
+消息、wake、tracked request（push 和 pull）和附件都能走中继。附件分成 1 MiB 的块经中继传输，内容端到端加密，
+但流量全部经过你的服务器。在公司电脑上运行之前，请先确认这符合公司的规定，尤其是把公司文件传出公司网络这一点。
 
 ## 0. 约定
 
@@ -239,6 +239,8 @@ sh "$Y" --home "$HOME_T" relay directory     # trust: trusted / untrusted / key_
 | 12 | Grok 电脑：`sh "$Y" --home "$HOME_T" request send work-mini.relay/codex "验收：请回复 ok" --wake now` | `"status": 202`、`"submission": "accepted"`；记下 `id` |
 | 13 | Grok 电脑：`sh "$Y" --home "$HOME_T" request status 请求ID` | 几秒内变为 `state=received`；Codex 回复后变为 `completed`，下面一行是回复内容 |
 | 14 | Grok 电脑：`sh "$Y" --home "$HOME_T" request send work-mini.relay/codex "x" --transport pull`，公司 Mac 回复后再 `request status 请求ID --refresh` | 回复前状态不变（pull 不推送）；`--refresh` 之后为 `completed` |
+| 15 | Grok 电脑：`sh "$Y" --home "$HOME_T" send work-mini.relay "附件验收" --file 一个几 MB 的文件`；公司 Mac：`sh "$Y" --home "$HOME_T" fetch 消息ID` | `OK ... sha256 verified`；记下用时 |
+| 16 | 公司 Mac：`sh "$Y" --home "$HOME_T" reply 请求ID "附件结果" --file 一个文件`（第 12 项的请求）；Grok 电脑：`request status 请求ID --json` 里 `response.id`，再 `fetch 该ID` | `OK ... sha256 verified` |
 
 第 10、11 项最能暴露公司网络代理的问题；如果长轮询总是被掐断，记下 `serve.log` 里的报错，这会影响后续阶段的设计。
 
@@ -277,10 +279,14 @@ sh "$Y" --home "$HOME_T" relay untrust work-mini                  # 每台信任
 | `unauthorized` | 这台设备已被中继吊销 |
 | `relay_unreachable` | 连不上中继：DNS、证书、公司代理或中继没运行 |
 | `receiver_identity_changed` | 接收端运行期间 `relay/device.json` 被换过；重启接收端 |
+| `quota_exceeded` | 这台设备今天经中继转发的数据超过了 `daily_bytes`；等到 00:00 UTC，或在服务器上调高后重启中继 |
 
 ## 9. 已知限制
 
-- 不转发附件：`send --file`、`request send --file` 和带 `--file` 的回复会被拒绝（第 3 阶段）。
+- 附件速度取决于加密实现：装了 `cryptography` 包的 Python 很快；没装时内置实现每 MiB 收发两端合计约 2 秒
+  （约 0.5 MB/s），`doctor` 的 `relay-cipher` 会显示是哪一种。`fetch` 中断后再运行一次会从断点继续。
+- 中继限制每台设备每个 UTC 日最多转发 8 GiB 密文（附件约多出三分之一），超出后报 `quota_exceeded`，第二天
+  00:00 UTC 恢复。要改上限，编辑中继数据目录里的 `relay.json` 的 `daily_bytes`（字节数），再重启中继。
 - push request 的 `received`、`running` 和结果由公司 Mac 经中继推回 Grok，所以 Grok 的接收端要打开 `"relay": "on"`
   并在运行；Grok 不在线时公司 Mac 会按 2 到 60 秒的间隔重试，结果不会丢。不想依赖这一点时用 `--transport pull`，
   再用 `request status --refresh` 取结果。

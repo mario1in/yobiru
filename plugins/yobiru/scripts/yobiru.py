@@ -444,7 +444,8 @@ def relay_facts(home, mode, probe):
     except Exception as e:
         r["error"] = "cannot read %s: %s" % (home / "relay" / "device.json", type(e).__name__)
         return r
-    r.update(joined=True, name=device.name, node=device.node, url=device.url, trusted=sorted(device.trusted()))
+    r.update(joined=True, name=device.name, node=device.node, url=device.url, trusted=sorted(device.trusted()),
+             fast_cipher=getattr(relay.e2e(), "_Fast", None) is not None)
     if probe:
         try:
             status, body = device.call("GET", "/v1/health", timeout=5)
@@ -599,6 +600,12 @@ def relay_check(f, add):
             "trusts: %s" % (", ".join(n + ".relay" for n in r["trusted"]) or "nobody"),
             None if r["trusted"] else "compare fingerprints on each device (`%s relay whoami`), then "
             "`%s relay trust NAME --fingerprint FP`" % (PRODUCT, PRODUCT))
+        if r.get("fast_cipher"):
+            add("ok", "relay-cipher", "ChaCha20-Poly1305 from the cryptography package")
+        else:
+            add("info", "relay-cipher", "built-in ChaCha20-Poly1305: attachments move at about 0.5 MB/s",
+                "for faster attachments install the cryptography package for %s, where your policy allows it"
+                % f["python"]["executable"])
         server = r.get("server")
         if server is not None and server.get("reachable") and server.get("relay_id_matches"):
             add("ok", "relay-server", "%s answers" % r["url"])

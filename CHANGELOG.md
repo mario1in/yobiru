@@ -17,8 +17,14 @@
 - **Tracked requests over the relay (phase 2).** `request send` to a `NAME.relay` device works with push and pull:
   the receiver pushes `received`, `running` and the result back through the relay (the sender's receiver must have
   `"relay"` on), and `request status --refresh` and `request resume` reach relay devices. A relay pull request is
-  owned by the sender's key (`relay-<kid>`). Attachments, including pull uploads and result files, are still
-  refused over a relay.
+  owned by the sender's key (`relay-<kid>`).
+- **Attachments over the relay (phase 3).** Message attachments, pull uploads and result files move through the
+  relay in 1 MiB pieces: receivers answer `Range: bytes=a-b` on `/f/<token>/<name>` and accept
+  `PUT /requests/<id>/uploads/<token>?offset=N` pieces (also over Tailscale), an interrupted relay `fetch`
+  continues from its `.part` file, and the SHA-256 is checked as before. The relay caps each poll answer at one
+  large frame and each device at `daily_bytes` of ciphertext per UTC day (default 8 GiB, `server init --daily-gib`),
+  answering `429 quota_exceeded` beyond it. `doctor` reports whether the relay cipher comes from `cryptography` or
+  the slower built-in implementation.
 
 ## 0.7.15 (2026-10-26)
 
