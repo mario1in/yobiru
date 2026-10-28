@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Self-hosted relay (preview, phase 1).** Add `relay.py` and `yobiru relay`: your own devices exchange tailmsg
+  messages through a relay you host, over outbound HTTPS and without Tailscale. Frames are sealed for the receiver
+  and authenticated by the sender's key; a device talks only to peers whose fingerprints it trusted explicitly, and
+  the relay stores no messages. Devices appear as `NAME.relay`; set `"relay": "on"` or `"only"` in `config.json`
+  to receive. Phase 1 carries `/health`, `/info` and `/msg` with wake; tracked requests and attachments are
+  refused over a relay for now. Tailscale names ending in `.relay` are refused. See `docs/RELAY_DESIGN.md`.
+
 ## 0.7.15 (2026-10-26)
 
 This release packages the Muse connector and later agent workflow fixes previously available only from the reviewed main source.

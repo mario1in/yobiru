@@ -2,9 +2,13 @@
   "about": "Byte-identical copies of canonical files at the repository root, refreshed by tools/build_plugin.py sync. Edit the root files, not these copies.",
   "protocol": "tailmsg v1",
   "files": {
+    "scripts/relay.py": {
+      "source": "relay.py",
+      "sha256": "13c29f841ab9d55a7be9b478a21760d8d4ecc9ce71ec6eb3117842f8e76fac61"
+    },
     "scripts/tailmsg.py": {
       "source": "tailmsg.py",
-      "sha256": "fb0fd3296dd0d2457fed42191a4b62b0b233f7f7514ff37196fc39cc05a49963"
+      "sha256": "e77d99673cca434e8e30b0702742703cf9bb575ad715e051ad2672dbf98793bb"
     },
     "scripts/codex_bridge/CODEX_DISPATCHER.md": {
       "source": "CODEX_DISPATCHER.md",

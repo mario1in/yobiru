@@ -7,7 +7,7 @@ read-only, expiring, unguessable URL on its own tailnet address; the receiver pu
 them itself and verifies sha256. Auth = Tailscale identity (`tailscale whois`) +
 per-machine access policy. Python 3.8+ stdlib only. See SPEC.md.
 """
-import argparse, datetime as dt, errno, hashlib, http.client, ipaddress, json, mimetypes, os
+import argparse, datetime as dt, errno, hashlib, http.client, importlib.util, io, ipaddress, json, mimetypes, os
 import re, secrets, shlex, shutil, socket, sqlite3, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
@@ -79,6 +79,35 @@ def is_pull_request(env):
 def sender_matches(env, ident):
     expected = peer_identity(ident) if is_pull_request(env) else ident.get("node")
     return bool(expected) and env.get("from", "").lower().rstrip(".") == expected
+
+
+# ---------------------------------------------------------------- relay (relay.py, docs/RELAY_DESIGN.md)
+RELAY_SUFFIX = ".relay"         # devices on a self-hosted relay; Tailscale names with this suffix are refused
+RELAY_ROUTES = {("GET", "/health"), ("GET", "/info"), ("POST", "/msg")}
+_relay = None
+
+
+def is_relay_name(name):
+    return isinstance(name, str) and name.lower().rstrip(".").endswith(RELAY_SUFFIX)
+
+
+def relay_module():
+    """relay.py next to this file, loaded only when a relay is configured or addressed."""
+    global _relay
+    if _relay is None:
+        spec = importlib.util.spec_from_file_location("yobiru_relay", str(Path(__file__).with_name("relay.py")))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _relay = module
+    return _relay
+
+
+def relay_ident(name, kid):
+    # Authenticated by the sender's trusted key, never by the relay: no "ip", so access_decision applies the
+    # same rules as to a whois identity. The StableID changes with the key.
+    node = name + RELAY_SUFFIX
+    return {"node": node, "host": name, "tags": [], "user": "", "stable_id": "relay-" + kid, "dns_name": node,
+            "transport": "relay"}
 
 
 # ---------------------------------------------------------------- helpers
@@ -440,6 +469,8 @@ def parse_config(raw):
         if spec.get("wake_max") is not None and spec["wake_max"] not in WAKE_LEVELS:
             raise RuntimeError("config agents[%r].wake_max must be one of now/batch/none" % name)
         out[norm_agent(name)] = spec
+    if cfg.get("relay", "off") not in ("off", "on", "only"):
+        raise RuntimeError("config relay must be off, on (relay and Tailscale) or only (no Tailscale)")
     return cfg, out
 
 
@@ -532,6 +563,9 @@ class Ctx:
                         type(node.get("User")) is int and node["User"] > 0 and
                         type(up.get("ID")) is int and up["ID"] == node["User"])
         dns_name = (node.get("Name") or "").rstrip(".").lower()
+        if is_relay_name(dns_name):
+            log("whois refused for", ip, "- a Tailscale name must not look like a relay device")
+            return None
         ident = {
             "ip": ip,
             "node": dns_name or (stable_peer_id(stable_id) if stable_valid else ""),
@@ -1631,19 +1665,27 @@ def make_handler(ctx, me):
                 return False
             return True
 
-        def identify(self, fresh=False):
+        # The source checks below are the only Tailscale-specific ones; a relay frame overrides them.
+        accepts_requests = True
+
+        def source_ok(self):
+            return is_tailnet_ip(self.client_address[0])
+
+        def lookup_peer(self, fresh=False):
             ip = self.client_address[0]
-            if not is_tailnet_ip(ip):
+            return fresh_whois(ctx, ip) if fresh else ctx.whois(ip)
+
+        def identify(self, fresh=False):
+            if not self.source_ok():
                 self.reply(403, {"ok": False, "error": "not a tailnet address"})
                 return None
             # A confirmed change stays locked, without spending another peer lookup. Otherwise
             # refresh self identity after the potentially slow peer lookup, before metadata/effects.
             guard = getattr(ctx, "receiver_identity", None)
-            if guard is not None and guard.changed:
-                self.check_receiver_identity()
+            if guard is not None and guard.changed and not self.check_receiver_identity():
                 return None
             try:
-                ident = fresh_whois(ctx, ip) if fresh else ctx.whois(ip)
+                ident = self.lookup_peer(fresh)
             except TailscaleUnavailable:
                 self.reply(503, {"ok": False, "error": "identity lookup unavailable",
                                  "code": "identity_unavailable"}, {"Retry-After": "1"})
@@ -1667,7 +1709,7 @@ def make_handler(ctx, me):
         def do_GET(self):
             path = urllib.parse.urlparse(self.path).path
             if path == "/health":
-                if not is_tailnet_ip(self.client_address[0]):
+                if not self.source_ok():
                     return self.reply(403, {"ok": False, "error": "not a tailnet address"})
                 # 200 whenever the receiver answers (transport reachability); `ok`/`status` carry maintenance
                 # readiness, so a degraded receiver is reachable but not reported healthy.
@@ -1685,6 +1727,8 @@ def make_handler(ctx, me):
                 except Exception as e:
                     log("info failed:", type(e).__name__)
                     return self.reply(500, {"ok": False, "error": "info unavailable"})
+                if not self.accepts_requests:
+                    body["capabilities"] = []      # advertise only what this transport carries
                 return self.reply(200, body)
             if path.startswith("/requests/"):
                 ident = self.identify(fresh=True)
@@ -1819,6 +1863,8 @@ def make_handler(ctx, me):
             err = validate_env(env)
             if err:
                 return self.reply(400, {"ok": False, "error": err})
+            if not self.accepts_requests and ("request" in env or "response" in env):
+                return self.reply(501, {"ok": False, "error": "tracked requests are not carried over this transport yet"})
             if is_pull_request(env) and route == "/msg":
                 ident = self.identify(fresh=True)
                 if not ident or not self.authorize(ident):
@@ -2744,10 +2790,13 @@ class NumericHTTPServer(ThreadingHTTPServer):
 
 
 def cmd_serve(ctx, a):
-    me = ctx.self_node()
-    ctx.receiver_identity = ReceiverIdentity(ctx, me)
-    bind = ctx.cfg.get("bind") or ctx.ts("ip", "-4").split()[0]
-    port = int(ctx.cfg["port"])
+    mode = ctx.cfg.get("relay", "off")
+    device = relay_module().Device(ctx.home) if mode != "off" else None
+    if mode != "only":
+        me = ctx.self_node()
+        ctx.receiver_identity = ReceiverIdentity(ctx, me)
+        bind = ctx.cfg.get("bind") or ctx.ts("ip", "-4").split()[0]
+        port = int(ctx.cfg["port"])
     if ctx.cfg["access_policy"] == "allowlist" and not ctx.cfg["allow"]:
         log("WARNING: allow list empty - every POST /msg will be rejected")
     names = [None] if not ctx.agents and ctx.cfg.get("default_agent") is None else \
@@ -2761,11 +2810,26 @@ def cmd_serve(ctx, a):
         log("wake adapter%s:" % tag, desc)
     if ctx.cfg.get("self_agent"):
         log("self_agent (sent as from_agent):", ctx.cfg["self_agent"])
-    srv = NumericHTTPServer((bind, port), make_handler(ctx, me["node"]))
-    srv.daemon_threads = True
     # Request lifecycle, response delivery and attachment cleanup run as supervised workers; the serving loop
     # restarts only a worker whose thread has ended (see Maintenance).
     ctx.maintenance = Maintenance(ctx)
+    if device is not None:
+        threading.Thread(target=serve_relay, args=(ctx, device, ctx.maintenance.stop), daemon=True,
+                         name="yobiru-relay").start()
+        log("relay: receiving as %s through %s" % (device.node, device.url))
+    if mode == "only":
+        ctx.maintenance.start()
+        log("tailmsg v%d serving %s through the relay only  home=%s" % (VERSION, device.node, ctx.home))
+        try:
+            while not ctx.maintenance.stop.wait(0.5):
+                ctx.maintenance.service_actions()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            ctx.maintenance.stop.set()
+        return
+    srv = NumericHTTPServer((bind, port), make_handler(ctx, me["node"]))
+    srv.daemon_threads = True
     srv.service_actions = ctx.maintenance.service_actions
     ctx.maintenance.start()
     log("tailmsg v%d serving %s on %s:%d  home=%s" % (VERSION, me["node"], bind, port, ctx.home))
@@ -2775,6 +2839,119 @@ def cmd_serve(ctx, a):
         pass
     finally:
         ctx.maintenance.stop.set()
+
+
+class _FrameConnection(object):
+    """Stands in for the socket of a relay frame: the handler only adjusts timeouts on it."""
+
+    def settimeout(self, value):
+        pass
+
+    def gettimeout(self):
+        return None
+
+
+def relay_handler(ctx, device):
+    """The receiver's own handler, fed one opened relay frame at a time instead of a TCP connection."""
+    base = make_handler(ctx, device.node)
+
+    class RelayFrame(base):
+        accepts_requests = False
+
+        def __init__(self, request, sender, sender_key):
+            self.sender, self.sender_key = sender, sender_key
+            self.client_address, self.server, self.close_connection = ("relay:" + sender, 0), None, True
+            self.connection = _FrameConnection()
+            head = ["%s %s HTTP/1.1" % (request["method"], request["path"]), "Host: " + device.node,
+                    "Content-Length: %d" % len(request["body"])]
+            head += ["%s: %s" % item for item in request["headers"].items()]
+            self.rfile = io.BytesIO(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + request["body"])
+            self.wfile = io.BytesIO()
+
+        def source_ok(self):
+            return True
+
+        def lookup_peer(self, fresh=False):
+            # Read for every frame, so `relay untrust` or a changed key takes effect on the next request.
+            if device.trusted_key(self.sender) != self.sender_key:
+                return None
+            return relay_ident(self.sender, relay_module().e2e().kid(self.sender_key))
+
+        def check_receiver_identity(self):
+            if device.unchanged():
+                return True
+            self.close_connection = True
+            self.reply(503, {"ok": False, "error": "relay enrollment changed; restart the receiver",
+                             "code": "receiver_identity_changed"}, {"Retry-After": "1"})
+            return False
+
+    return RelayFrame
+
+
+def relay_frame(ctx, device, handler, frame, slots):
+    try:
+        relay = relay_module()
+        try:
+            request, sender, sender_key = device.open_request(frame)
+        except relay.RelayError as exc:
+            log("relay frame refused:", exc)
+            device.refuse(frame.get("frame_id") if isinstance(frame, dict) else None, exc.code)
+            return
+        route = (request["method"], urllib.parse.urlparse(request["path"]).path)
+        if route in RELAY_ROUTES:
+            h = handler(request, sender, sender_key)
+            h.handle_one_request()
+            head, _, body = h.wfile.getvalue().partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            status = int(lines[0].split()[1]) if lines[0] else 502
+            headers = {k.strip(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])
+                       if k.strip().lower() == "content-type"}
+        else:
+            status, headers = 404, {"Content-Type": "application/json"}
+            body = json.dumps({"ok": False, "error": "not carried over the relay"}).encode()
+        device.answer(frame["frame_id"], sender, sender_key, status, headers, body)
+    except Exception as exc:          # one frame must never stop the relay loop
+        log("relay frame failed:", type(exc).__name__, exc)
+    finally:
+        slots.release()
+
+
+def serve_relay(ctx, device, stop, workers=8):
+    """Poll the relay and answer each frame on its own thread, like the TCP server's connection threads."""
+    relay, handler = relay_module(), relay_handler(ctx, device)
+    slots, delay = threading.BoundedSemaphore(workers), 1
+    while not stop.is_set():
+        try:
+            frames = device.poll()
+            delay = 1
+        except relay.RelayError as exc:
+            log("relay poll failed (retrying in %ds): %s" % (delay, exc))
+            stop.wait(delay)
+            delay = min(60, delay * 2)
+            continue
+        for frame in frames:
+            slots.acquire()
+            threading.Thread(target=relay_frame, args=(ctx, device, handler, frame, slots), daemon=True).start()
+
+
+def relay_http_json(device, to_fqdn, method, path, body=None, timeout=15):
+    """http_json() through the relay: the same (status, JSON) result and TransportError on failure."""
+    relay = relay_module()
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else b""
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    try:
+        status, _, raw = device.exchange(device.canonical(to_fqdn), method, path, data, headers, timeout=timeout)
+    except relay.RelayError as exc:
+        detail = "relay %s %s to %s failed: %s" % (method, path, to_fqdn, exc)
+        if exc.unknown and method == "POST" and path == "/msg":
+            detail += (" Delivery is unknown for message %s; the receiver may already have stored it. "
+                       "Check its inbox for this ID before sending again; a new send creates a new ID." %
+                       (body or {}).get("id", "(unknown)"))
+        raise TransportError(detail) from exc
+    try:
+        return status, json.loads(raw)
+    except Exception:
+        return status, {"raw": raw[:200].decode("utf-8", "replace")}
 
 
 # ---------------------------------------------------------------- client
@@ -3089,18 +3266,34 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     for k, v in (("agent", agent), ("from_agent", from_agent)):
         if v is not None and agent_name_error(v):
             die("bad %s %r: %s" % (k, v, agent_name_error(v)))
-    self_node = ctx.self_node()
-    me = self_node["node"]
     host, port = split_peer(addr, int(ctx.cfg["port"]))
-    to_fqdn, to_ip = ctx.resolve(host)
     tracked = a.kind == "request" and not getattr(a, "legacy_request", False)
     pull = getattr(a, "transport", "push") == "pull"
+    device = None
+    if is_relay_name(host):
+        # A relay device: no Tailscale lookup at all. Phase 1 carries messages only (docs/RELAY_DESIGN.md).
+        if tracked or pull:
+            die("tracked requests are not carried over a relay yet; send a message, or use --legacy-request")
+        if getattr(a, "file", None):
+            die("attachments are not carried over a relay yet")
+        device = relay_module().Device(ctx.home)
+        self_node = {"node": device.node}
+        to_fqdn, to_ip = device.canonical(host) + RELAY_SUFFIX, None
+    else:
+        self_node = ctx.self_node()
+        to_fqdn, to_ip = ctx.resolve(host)
+    me = self_node["node"]
+
+    def exchange(method, path, body=None, **options):
+        if device is not None:
+            return relay_http_json(device, to_fqdn, method, path, body, timeout=options.get("timeout", 15))
+        return http_json(to_ip, port, method, path, body, host=to_fqdn, **options)
+
     if pull and not tracked:
         die("--transport pull requires a tracked request; it cannot be combined with --legacy-request")
     if tracked:
         try:
-            status, info = http_json(to_ip, port, "GET", "/info", host=to_fqdn, timeout=5,
-                                     deadline=5, limit=64 * 1024)
+            status, info = exchange("GET", "/info", timeout=5, deadline=5, limit=64 * 1024)
         except TransportError as exc:
             die("request preflight transport failure; no request created: %s" % exc)
         if status in (401, 403):
@@ -3161,7 +3354,7 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
         raise
     try:
         status, resp = submit_pull_request(ctx, env, to_fqdn, to_ip, port) if pull else \
-            http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
+            exchange("POST", "/msg", env)
     except (RuntimeError, OSError):
         if tracked:
             with request_db(ctx) as db:
@@ -3177,7 +3370,7 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
         # the rejected attempt was not stored). An explicit --agent / --as is never dropped silently.
         print("note: %s does not understand from_agent (old tailmsg); resent without it" % to_fqdn, file=sys.stderr)
         del env["from_agent"]
-        status, resp = http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
+        status, resp = exchange("POST", "/msg", env)
     out = {"status": status, "response": resp, "id": msg_id, "to": to_fqdn,
            "files": len(env["request"].get("uploads", [])) if pull else len(env.get("fetch", []))}
     if pull:

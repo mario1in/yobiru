@@ -109,6 +109,13 @@ see docs/PUBLIC_BOTS.md):
   resource-service {{init,add,remove,list,serve}} --dir DIR
                              private owner-approved text exports, released per caller through the gateway
 
+Self-hosted relay for your own devices without Tailscale (preview, messages only; docs/RELAY_DESIGN.md):
+  relay server {{init,serve,invite,devices,revoke}} --relay-home DIR
+                             on the relay host: loopback HTTP behind your own HTTPS proxy, one-time invites
+  relay join URL --name NAME --invite CODE      relay {{whoami,directory,trusted,ping NAME,info NAME}}
+  relay trust NAME --fingerprint FP             relay untrust NAME
+                             then address NAME.relay[/AGENT]; config "relay": "on" or "only" to receive
+
 Messaging (passed unchanged to the bundled tailmsg.py):
   request send PEER[/AGENT] TEXT [--transport push|pull] [--file F] [--timeout-seconds 900]
   request status ID [--refresh] [--json]     request list [--json]
@@ -4021,6 +4028,23 @@ def cmd_public(home, home_source, argv):
     return run_public("bot_client.py", ["--home", str(home)] + list(argv))
 
 
+def cmd_relay(home, home_source, argv):
+    """The self-hosted relay and this device's enrollment (bundled relay.py, next to tailmsg.py)."""
+    path = HERE / "relay.py"
+    if not path.is_file():
+        die("bundled relay.py is missing; reinstall the plugin", 2)
+    python = os.environ.get(PYTHON_ENV) or sys.executable
+    argv = [python, str(path), "--home", str(home)] + list(argv)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "posix":
+        try:
+            os.execvp(python, argv)
+        except OSError as e:
+            die("cannot run %s: %s" % (python, e), 127)
+    return subprocess.call(argv)
+
+
 def cmd_calendar_service(home, home_source, argv):
     return run_public("bot_calendar.py", argv)
 
@@ -4069,7 +4093,7 @@ PLUGIN_COMMANDS = {"paths": cmd_paths, "doctor": cmd_doctor, "status": cmd_statu
                    "service-template": cmd_service_template, "codex-bridge": cmd_codex_bridge,
                    "onboard": cmd_onboard, "agents": cmd_agents, "peers": cmd_agents, "session": cmd_session, "update": cmd_update,
                    "gateway": cmd_gateway, "public": cmd_public, "calendar-service": cmd_calendar_service,
-                   "resource-service": cmd_resource_service,
+                   "resource-service": cmd_resource_service, "relay": cmd_relay,
                    "mcp": cmd_mcp, "muse": cmd_muse, "claude-bridge": cmd_claude_bridge}
 
 
