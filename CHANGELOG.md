@@ -12,6 +12,8 @@
   receiver runtime, also when the runtime is already current. `doctor` skips Tailscale and the local port for
   `"relay": "only"` and checks the relay enrollment, trust, relay server and the runtime's relay files instead.
   Deployment: `docs/RELAY_DEPLOY.zh-CN.md`.
+- **Relay container.** `deploy/relay/Dockerfile` runs the relay as a non-root container that initializes its
+  state on a persistent `/data` volume on first start (for example on Coolify); agent guides are in `docs/agents/`.
 
 ## 0.7.15 (2026-10-26)
 

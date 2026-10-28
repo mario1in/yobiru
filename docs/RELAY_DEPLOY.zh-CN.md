@@ -4,6 +4,9 @@
 不装 Tailscale；Grok bot 的电脑和家里的 Mac mini 同时保留 Tailscale。完成后，Grok bot 可以给公司 Mac 上的
 Codex 发消息并唤醒它，Codex 的回复会原路回来。
 
+交给 agent 执行的版本：[Coolify 部署中继](agents/RELAY_COOLIFY.md)、[更新 Grok Bot](agents/RELAY_GROK_UPDATE.md)、
+[安装公司 Mac](agents/RELAY_WORK_MAC.md)。容器镜像见 `deploy/relay/Dockerfile`。
+
 **第 1 阶段只转发消息。** tracked request（`request send`）和附件走中继时会被明确拒绝，要等第 2、3 阶段。
 在公司电脑上运行之前，请先确认这符合公司的规定。
 
