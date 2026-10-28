@@ -72,6 +72,9 @@ Check and set up (read-only unless --apply):
   doctor [--peer HOST[:PORT]] [--json]
                              check local setup; optionally probe peer health, identity access and pull support
   status [--json]            summarize config, agents, sessions, versions, wake settings and inbox counts
+  dashboard [--port N] [--json]
+                             read-only local page (127.0.0.1) of messages received and sent, tracked
+                             requests, pending pushes, receiver health and recent log problems
   session {{list,bind,unbind}} explicit agent -> existing session binding (exact id; bind/unbind need --apply)
   policy {{show,set}}         show or deliberately change incoming access policy (tailnet / allowlist + deny)
   update {{check,status,notify,maintain,reminder-template}}
@@ -4209,6 +4212,13 @@ def cmd_claude_bridge(home, home_source, argv):
     return subprocess.call(command)
 
 
+def cmd_dashboard(home, home_source, argv):
+    """Read-only local traffic page (yobiru_dashboard.py next to this file)."""
+    sys.path.insert(0, str(HERE))
+    import yobiru_dashboard
+    return yobiru_dashboard.main(home, argv)
+
+
 def cmd_mcp(home, home_source, argv):
     """Local stdio MCP server over the messaging commands (yobiru_mcp.py next to this file)."""
     sys.path.insert(0, str(HERE))
@@ -4223,7 +4233,7 @@ PLUGIN_COMMANDS = {"paths": cmd_paths, "doctor": cmd_doctor, "status": cmd_statu
                    "onboard": cmd_onboard, "agents": cmd_agents, "peers": cmd_agents, "session": cmd_session, "update": cmd_update,
                    "gateway": cmd_gateway, "public": cmd_public, "calendar-service": cmd_calendar_service,
                    "resource-service": cmd_resource_service, "relay": cmd_relay,
-                   "mcp": cmd_mcp, "muse": cmd_muse, "claude-bridge": cmd_claude_bridge}
+                   "mcp": cmd_mcp, "dashboard": cmd_dashboard, "muse": cmd_muse, "claude-bridge": cmd_claude_bridge}
 
 
 def main(argv=None):

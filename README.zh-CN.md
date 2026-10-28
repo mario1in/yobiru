@@ -355,6 +355,15 @@ sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-
 
 已安装 Codex 桥接时，它固定的入口会话 UUID 会被自动报告；其原生名称（`Thread.name`，通过只读元数据的 `thread/read` 读取）在改名后约五分钟内刷新；与桥接冲突的绑定会被拒绝。绑定只是指明会话，唤醒方式需另行配置（桥接或 `wake-config`）。
 
+## 看板：设备之间收发了什么
+
+```sh
+sh "$Y" dashboard                # 打开 http://127.0.0.1:端口/?t=令牌；Ctrl-C 停止
+sh "$Y" dashboard --json         # 输出一次同样的汇总，供脚本和 agent 使用
+```
+
+只读页面，展示本机的流量：与每台对端设备之间的消息流向（Tailscale 或中继）、按小时或按天的消息量、每条收到和发出的消息及其状态（已唤醒、已处理、唤醒失败、已送达、request 状态）、tracked request、还没推回对方的结果、接收端健康状况，以及 `serve.log` 里最近的问题。它只读数据目录，只在 `127.0.0.1` 上监听，URL 里带令牌。发出的那一半来自 `sent.jsonl`：从这个版本起 `send` 和 `reply` 才会写它，之前发出的消息只在接收它的设备上看得到。
+
 ## 隐私与信任边界
 
 存储位置、网络访问和删除方式见[隐私说明](docs/PRIVACY.md)。

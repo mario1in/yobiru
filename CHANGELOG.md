@@ -25,6 +25,14 @@
   large frame and each device at `daily_bytes` of ciphertext per UTC day (default 8 GiB, `server init --daily-gib`),
   answering `429 quota_exceeded` beyond it. `doctor` reports whether the relay cipher comes from `cryptography` or
   the slower built-in implementation.
+- **Local dashboard.** `yobiru dashboard` serves a read-only page on `127.0.0.1` (behind a token in its URL) that
+  shows this device's traffic: message flow to each peer by transport, volume over time, every message received and
+  sent with its status (woken, processed, wake failed, delivered, request state), tracked requests, results waiting
+  to be pushed back, receiver health and recent problems from `serve.log`. Every edge, message, request and pending
+  push is marked as relay or Tailscale (dashed edges are relay), with a filter by transport. `--json` prints the
+  same summary once.
+  For the sent side, `send` and `reply` now append each message's metadata and a 500-character preview to
+  `sent.jsonl` in the data home (owner-only, trimmed past 4 MiB); messages sent before the upgrade are not listed.
 
 ## 0.7.15 (2026-10-26)
 

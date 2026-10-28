@@ -452,7 +452,15 @@ class RelayLoopbackTests(unittest.TestCase):
         out = self.tm_json("alpha", "send", "bravo.relay", "with a file", "--file", str(path))
         self.assertEqual((202, 1), (out["status"], out["files"]))
         self.assertEqual(digest, self.fetched("bravo", out["id"], "notes.bin"))
-        checks = {c["check"]: c for c in json.loads(self.tm("bravo", "doctor", "--json").stdout)["checks"]}
+        sent = [json.loads(line) for line in (self.home["alpha"] / "sent.jsonl").read_text().splitlines()]
+        row = [r for r in sent if r["id"] == out["id"]][0]
+        self.assertEqual(("bravo.relay", "relay", 202, 1, path.stat().st_size),
+                         (row["to"], row["transport"], row["status"], row["files"], row["bytes"]))
+        board = json.loads(self.run_ok(["--home", str(self.home["alpha"]), "dashboard", "--json"]).stdout)
+        peer = [p for p in board["peers"] if p["peer"] == "bravo.relay"][0]
+        self.assertEqual("relay", peer["transport"])
+        self.assertGreaterEqual(peer["out"], 1)
+        checks ={c["check"]: c for c in json.loads(self.tm("bravo", "doctor", "--json").stdout)["checks"]}
         self.assertIn(checks["relay-cipher"]["status"], ("ok", "info"))      # which cipher moves the pieces
 
     def test_3_untrusting_a_sender_refuses_its_next_message(self):

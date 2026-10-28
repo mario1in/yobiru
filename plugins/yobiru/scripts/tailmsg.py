@@ -3486,6 +3486,44 @@ def submit_pull_request(ctx, env, route):
     return status, body
 
 
+SENT_LOG = "sent.jsonl"
+SENT_LOG_BYTES = 4 << 20          # past this, the oldest half is dropped on the next send
+
+
+def record_sent(ctx, env, transport, status=None, error=None):
+    """Append one line about a message this machine sent to <home>/sent.jsonl, for `yobiru dashboard`.
+
+    The receiver keeps the message itself; the sender otherwise forgets it once the POST returns. Best effort:
+    a failure here never fails the send, and two sends racing a trim may lose a line."""
+    files = env["request"].get("uploads", []) if "uploads" in env.get("request", {}) else env.get("fetch", [])
+    row = {"id": env["id"], "ts": env["ts"], "to": env["to"], "transport": transport, "kind": env["kind"],
+           "agent": env.get("agent"), "from_agent": env.get("from_agent"), "reply_to": env.get("reply_to"),
+           "text": env["text"][:INBOX_PREVIEW], "files": len(files),
+           "bytes": sum(f.get("size", 0) for f in files if isinstance(f, dict)),
+           "tracked": "request" in env, "status": status, "error": error}
+    path = ctx.home / SENT_LOG
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps(row, ensure_ascii=True) + "\n").encode("ascii"))
+        finally:
+            os.close(fd)
+        if path.stat().st_size > SENT_LOG_BYTES:
+            lock = FileLock(ctx.home / (SENT_LOG + ".lock"))
+            if lock.acquire():
+                try:
+                    lines = path.read_bytes().splitlines(True)
+                    tmp = path.with_name(".%s.%s.tmp" % (SENT_LOG, secrets.token_hex(4)))
+                    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "wb") as out:
+                        out.write(b"".join(lines[len(lines) // 2:]))
+                    os.replace(str(tmp), str(path))
+                finally:
+                    lock.release()
+    except OSError as exc:
+        log("could not record sent message", env["id"], type(exc).__name__)
+
+
 def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     addr, addr_agent = split_addr(peer or a.peer)
     opt_agent = getattr(a, "agent", None)
@@ -3578,7 +3616,8 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     try:
         status, resp = submit_pull_request(ctx, env, route) if pull else \
             exchange("POST", "/msg", env)
-    except (RuntimeError, OSError):
+    except (RuntimeError, OSError) as exc:
+        record_sent(ctx, env, route.transport, error=type(exc).__name__)
         if tracked:
             with request_db(ctx) as db:
                 db.execute("UPDATE requests SET submission='unknown' WHERE direction='outgoing' AND id=?", (msg_id,))
@@ -3594,6 +3633,8 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
         print("note: %s does not understand from_agent (old tailmsg); resent without it" % to_fqdn, file=sys.stderr)
         del env["from_agent"]
         status, resp = exchange("POST", "/msg", env)
+    record_sent(ctx, env, route.transport, status, None if status in (200, 202) else
+                str(resp.get("error") if isinstance(resp, dict) and resp.get("error") else "HTTP %d" % status)[:200])
     out = {"status": status, "response": resp, "id": msg_id, "to": to_fqdn,
            "files": len(env["request"].get("uploads", [])) if pull else len(env.get("fetch", []))}
     if pull:

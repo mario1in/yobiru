@@ -36,6 +36,7 @@ files, discover peers, wake configured agents, track requests, and diagnose erro
 | Data | Where and why it is processed |
 | --- | --- |
 | Message text, structured data, sender/recipient identities, timestamps, message IDs and reply relationships | Stored by the participating receivers and sent to the addressed peer. |
+| Sent log (`sent.jsonl` in the data directory) | Written by the sender, readable only by the owner: for each message it sent, the recipient, time, agent names, kind, the first 500 characters of the text, the number and total size of attachments, and the HTTP status or error type. Read only by `yobiru dashboard` on the same computer. The oldest half is dropped once the file passes 4 MiB. |
 | Request text, receipts, progress, final results, deadlines and retry state | Stored in local request ledgers and response queues so delivery and outcomes can be reconciled. |
 | Attachments, filenames, sizes, hashes and download grants | Copied to the sender's local outbox; downloaded to the recipient's computer when requested. |
 | Tailscale device names and addresses, configured agent names, versions and session metadata | Read or cached locally and disclosed to allowed peers through discovery, routing and status responses. Session metadata can include a configured session ID and display or native name. |
@@ -227,7 +228,7 @@ passed to an agent provider.
 To stop future processing, disable the receiver, bridge and any update timer,
 and uninstall the plugin if desired. To remove local history, first stop the
 services using that data directory, then remove the relevant inbox, outbox,
-ledger, bridge state and logs. Review any backup you intend to retain. Coordinate
+sent log (`sent.jsonl`), ledger, bridge state and logs. Review any backup you intend to retain. Coordinate
 separately with recipients and service providers for their copies. Uninstalling
 the plugin alone does not promise deletion of persistent data or services.
 

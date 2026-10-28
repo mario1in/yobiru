@@ -358,6 +358,19 @@ sh "$Y" session bind --agent grok --runtime grok --session-id CHAT_ID --display-
 
 With the Codex bridge installed, its fixed dispatcher UUID is reported automatically and its native name (`Thread.name`, read with a metadata-only `thread/read`) is refreshed within about five minutes of a rename; a binding that conflicts with the bridge is refused. Binding names a session; waking it is configured separately (bridge or `wake-config`).
 
+## Dashboard: what moved between your devices
+
+```sh
+sh "$Y" dashboard                # opens http://127.0.0.1:PORT/?t=TOKEN; Ctrl-C stops it
+sh "$Y" dashboard --json         # the same summary once, for scripts and agents
+```
+
+A read-only page of this device's traffic: message flow to each peer (Tailscale or relay), volume per hour or day,
+every message received and sent with its status (woken, processed, wake failed, delivered, request state), tracked
+requests, results still waiting to be pushed back, receiver health and recent problems from `serve.log`. It reads
+only the data home and listens on `127.0.0.1` behind a token in its URL. The sent side comes from `sent.jsonl`, which
+`send` and `reply` write since this version; earlier messages show only on the device that received them.
+
 ## Privacy and trust
 
 See the [privacy notice](docs/PRIVACY.md) for storage, network contacts and deletion details.
