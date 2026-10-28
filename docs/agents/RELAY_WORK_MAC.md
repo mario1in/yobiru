@@ -2,7 +2,8 @@
 
 你在用户公司的 Mac 上工作。这台 Mac 不能装 Tailscale，所以 Yobiru 只走用户自己托管的中继：只需要出站 HTTPS，
 不开任何端口。目标：让用户的 Grok Bot（中继名 `grok`）能给这台 Mac 上的 Codex 发消息、唤醒它，并收到回复。
-这台 Mac 的中继名是 `work-mini`。中继只转发消息：第 1 阶段不支持 tracked request（`request send`）和附件。
+这台 Mac 的中继名是 `work-mini`。消息、wake 和 tracked request（`request send`）都能走中继；附件还不能
+（第 3 阶段），所以回复时不要带 `--file`。
 
 ## 需要用户提供
 
@@ -120,6 +121,8 @@ sh "$Y" --home "$HOME_T" relay directory        # grok: trusted, online: true
 sh "$Y" --home "$HOME_T" relay ping grok        # "status": 200
 sh "$Y" --home "$HOME_T" inbox                  # Grok 发来的测试消息，来自 grok.relay
 sh "$Y" --home "$HOME_T" reply 消息ID "ok"       # "status": 202
+sh "$Y" --home "$HOME_T" request status 请求ID --direction incoming   # Grok 发来的 request：peer 为 grok.relay
+sh "$Y" --home "$HOME_T" reply 请求ID "ok"       # tracked request 的回复：{"queued": true}，结果经中继推回 Grok
 launchctl kickstart -k "gui/$(id -u)/dev.tailmsg"; sleep 30; sh "$Y" --home "$HOME_T" relay ping grok   # 重启后仍为 200
 ```
 

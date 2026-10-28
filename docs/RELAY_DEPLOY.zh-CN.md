@@ -1,14 +1,15 @@
-# 自托管中继部署手册（第 1 阶段预览）
+# 自托管中继部署手册（预览，第 1–2 阶段）
 
 本手册把[中继](RELAY_DESIGN.md)部署到你自己的设备上：一台有公网域名的服务器运行中继；公司 Mac 只走中继，
 不装 Tailscale；Grok bot 的电脑和家里的 Mac mini 同时保留 Tailscale。完成后，Grok bot 可以给公司 Mac 上的
-Codex 发消息并唤醒它，Codex 的回复会原路回来。
+Codex 发消息并唤醒它，也可以派 tracked request（`request send`），收到 `received`、`running` 和最终结果；
+Codex 的回复会原路回来。
 
 交给 agent 执行的版本：[Coolify 部署中继](agents/RELAY_COOLIFY.md)、[更新 Grok Bot](agents/RELAY_GROK_UPDATE.md)、
 [安装公司 Mac](agents/RELAY_WORK_MAC.md)。容器镜像见 `deploy/relay/Dockerfile`。
 
-**第 1 阶段只转发消息。** tracked request（`request send`）和附件走中继时会被明确拒绝，要等第 2、3 阶段。
-在公司电脑上运行之前，请先确认这符合公司的规定。
+**中继还不转发附件。** 消息、wake、tracked request（push 和 pull）都能走中继；带 `--file` 的发送和带附件的
+结果会被明确拒绝，要等第 3 阶段。在公司电脑上运行之前，请先确认这符合公司的规定。
 
 ## 0. 约定
 
@@ -227,7 +228,7 @@ sh "$Y" --home "$HOME_T" relay directory     # trust: trusted / untrusted / key_
 | 1 | `curl -s https://relay.example.com/v1/health` | `"ok": true` |
 | 2 | `sh "$Y" --home "$HOME_T" relay directory` | 三台设备都在，work-mini 为 `trusted`、`online: true` |
 | 3 | `sh "$Y" --home "$HOME_T" relay ping work-mini` | `"status": 200`，`node` 为 `work-mini.relay` |
-| 4 | `sh "$Y" --home "$HOME_T" relay info work-mini` | `"status": 200`，`capabilities` 为 `[]`，列出 `codex` |
+| 4 | `sh "$Y" --home "$HOME_T" relay info work-mini` | `"status": 200`，`capabilities` 含 `request-lifecycle-v1` 和 `request-pull-v1`，列出 `codex` |
 | 5 | `sh "$Y" --home "$HOME_T" send work-mini.relay/codex "验收：请回复 ok" --wake now` | `"status": 202` |
 | 6 | 公司 Mac：`sh "$Y" --home "$HOME_T" inbox` | 有这条消息，来自 `grok.relay`；bridge 配好时 Codex 被唤醒 |
 | 7 | 公司 Mac：`sh "$Y" --home "$HOME_T" reply 消息ID "ok"` | `"status": 202` |
@@ -235,9 +236,11 @@ sh "$Y" --home "$HOME_T" relay directory     # trust: trusted / untrusted / key_
 | 9 | 公司 Mac 上 `launchctl kickstart -k "gui/$(id -u)/dev.tailmsg"`，等 30 秒后重做第 3 项 | 仍为 200 |
 | 10 | 公司 Mac 断网再恢复，等一分钟后重做第 3 项 | 仍为 200（轮询失败会以 1 秒到 60 秒的间隔重试） |
 | 11 | 公司 Mac 睡眠时重做第 5 项 | 失败且没有 `Delivery is unknown`：刚睡眠的约一分钟内报 `peer_timeout`，之后报 `peer_offline` |
-| 12 | Grok 电脑：`sh "$Y" --home "$HOME_T" request send work-mini.relay/codex "x"` | 被拒绝：`not carried over a relay yet`（第 1 阶段的预期） |
+| 12 | Grok 电脑：`sh "$Y" --home "$HOME_T" request send work-mini.relay/codex "验收：请回复 ok" --wake now` | `"status": 202`、`"submission": "accepted"`；记下 `id` |
+| 13 | Grok 电脑：`sh "$Y" --home "$HOME_T" request status 请求ID` | 几秒内变为 `state=received`；Codex 回复后变为 `completed`，下面一行是回复内容 |
+| 14 | Grok 电脑：`sh "$Y" --home "$HOME_T" request send work-mini.relay/codex "x" --transport pull`，公司 Mac 回复后再 `request status 请求ID --refresh` | 回复前状态不变（pull 不推送）；`--refresh` 之后为 `completed` |
 
-第 10、11 项最能暴露公司网络代理的问题；如果长轮询总是被掐断，记下 `serve.log` 里的报错，这会影响第 2 阶段的设计。
+第 10、11 项最能暴露公司网络代理的问题；如果长轮询总是被掐断，记下 `serve.log` 里的报错，这会影响后续阶段的设计。
 
 ## 8. 运维
 
@@ -275,9 +278,12 @@ sh "$Y" --home "$HOME_T" relay untrust work-mini                  # 每台信任
 | `relay_unreachable` | 连不上中继：DNS、证书、公司代理或中继没运行 |
 | `receiver_identity_changed` | 接收端运行期间 `relay/device.json` 被换过；重启接收端 |
 
-## 9. 已知限制（第 1 阶段）
+## 9. 已知限制
 
-- 只转发 `/health`、`/info`、`/msg`。tracked request 和附件会被拒绝，Grok 还不能通过中继拿到 `running` 和最终结果。
+- 不转发附件：`send --file`、`request send --file` 和带 `--file` 的回复会被拒绝（第 3 阶段）。
+- push request 的 `received`、`running` 和结果由公司 Mac 经中继推回 Grok，所以 Grok 的接收端要打开 `"relay": "on"`
+  并在运行；Grok 不在线时公司 Mac 会按 2 到 60 秒的间隔重试，结果不会丢。不想依赖这一点时用 `--transport pull`，
+  再用 `request status --refresh` 取结果。
 - `doctor` 只检查本机的中继登记、信任、relay 文件和中继服务器；对方能否收到，要用 `relay ping` 确认。
 - 接收端重启后的 5 分钟内，中继可以把重启前的帧重放一次；`/msg` 按消息 ID 去重，所以不会产生重复消息。
 - 中继能看到哪台设备在何时和哪台设备通信、数据多大，看不到内容。

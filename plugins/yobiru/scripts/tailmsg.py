@@ -83,7 +83,8 @@ def sender_matches(env, ident):
 
 # ---------------------------------------------------------------- relay (relay.py, docs/RELAY_DESIGN.md)
 RELAY_SUFFIX = ".relay"         # devices on a self-hosted relay; Tailscale names with this suffix are refused
-RELAY_ROUTES = {("GET", "/health"), ("GET", "/info"), ("POST", "/msg")}
+RELAY_ROUTES = {("GET", "/health"), ("GET", "/info"), ("POST", "/msg"), ("POST", "/requests/prepare")}
+RELAY_STATUS_RE = re.compile(r"^/requests/[A-Za-z0-9_-]{8,64}\Z")     # GET: request status for its sender
 _relay = None
 
 
@@ -108,6 +109,31 @@ def relay_ident(name, kid):
     node = name + RELAY_SUFFIX
     return {"node": node, "host": name, "tags": [], "user": "", "stable_id": "relay-" + kid, "dns_name": node,
             "transport": "relay"}
+
+
+def relay_route(method, path):
+    """What a relay frame may ask of the receiver. Request uploads (PUT) and file downloads wait for phase 3."""
+    return (method, path) in RELAY_ROUTES or (method == "GET" and bool(RELAY_STATUS_RE.match(path)))
+
+
+def relay_device(ctx):
+    """This data home's relay enrollment, read once per process (the receiver sets it at startup)."""
+    device = getattr(ctx, "relay_device", None)
+    if device is None:
+        device = ctx.relay_device = relay_module().Device(ctx.home)
+    return device
+
+
+def relay_peer_ident(device, peer):
+    """'work-mini.relay' -> the identity its currently trusted key proves, or None when it is not trusted."""
+    name = device.canonical(peer)
+    key = device.trusted_key(name)
+    return relay_ident(name, relay_module().e2e().kid(key)) if key else None
+
+
+def relay_self_node(device):
+    # The same identity shape as Ctx.self_node(): pull requests name their sender by this StableID.
+    return {"node": device.node, "stable_id": "relay-" + device.kid}
 
 
 # ---------------------------------------------------------------- helpers
@@ -1002,17 +1028,17 @@ def queue_response(db, row, state, text, fetch=None, max_bytes=256 * 1024):
     return env
 
 
-def save_outgoing_request(ctx, env, peer, port):
+def save_outgoing_request(ctx, env, peer, port, route=None):
     deadline = iso(parse_iso(env["ts"]) + dt.timedelta(seconds=env["request"]["timeout_seconds"]))
     with request_db(ctx) as db:
         db.execute("INSERT INTO requests(direction,id,peer,port,envelope,deadline,state,submission) "
                    "VALUES('outgoing',?,?,?,?,?,'pending','prepared')",
                    (env["id"], peer, port, json_canonical(env), deadline))
         if is_pull_request(env):
-            resolved, ip = ctx.resolve(peer)
-            ident = fresh_whois(ctx, ip)
+            route = route or peer_route(ctx, peer, port)
+            ident = route.identity(fresh=True)
             key = stable_peer_id(ident.get("stable_id")) if ident else None
-            if resolved != peer or not key or not ctx.access_decision(ident)[0]:
+            if route.peer != peer or not key or not ctx.access_decision(ident)[0]:
                 raise ValueError("pull destination requires an authenticated stable node identity and local authorization")
             db.execute("UPDATE requests SET record=? WHERE direction='outgoing' AND id=?",
                        (json_canonical({"peer_identity": key}), env["id"]))
@@ -1520,6 +1546,8 @@ def deliver_response(ctx, row, resolved):
         guard = getattr(ctx, "receiver_identity", None)
         if guard is not None and guard.changed:
             return "receiver_identity_changed"
+        if is_relay_name(row["peer"]):
+            return deliver_relay_response(ctx, row)
         if row["peer"] not in resolved:
             resolved[row["peer"]] = ctx.resolve(row["peer"])
         peer, ip = resolved[row["peer"]]
@@ -1537,6 +1565,21 @@ def deliver_response(ctx, row, resolved):
             raise RuntimeError("response delivery not confirmed (HTTP %s)" % status)
     except Exception as exc:
         return type(exc).__name__     # avoid storing URLs, message contents or arbitrary remote error bodies
+    return None
+
+
+def deliver_relay_response(ctx, row):
+    """deliver_response() to a relay device: its currently trusted key stands in for the whois lookup."""
+    device = relay_device(ctx)
+    if not device.unchanged():
+        return "receiver_identity_changed"
+    ident = relay_peer_ident(device, row["peer"])
+    if not ident or not ctx.access_decision(ident)[0]:
+        raise RuntimeError("response destination not trusted or denied by local access policy")
+    status, body = relay_http_json(device, row["peer"], "POST", "/msg", json.loads(row["envelope"]),
+                                   timeout=FLUSH_EXCHANGE_SECONDS)
+    if status not in (200, 202) or not isinstance(body, dict) or body.get("ok") is not True or body.get("id") != row["id"]:
+        raise RuntimeError("response delivery not confirmed (HTTP %s)" % status)
     return None
 
 
@@ -1666,8 +1709,6 @@ def make_handler(ctx, me):
             return True
 
         # The source checks below are the only Tailscale-specific ones; a relay frame overrides them.
-        accepts_requests = True
-
         def source_ok(self):
             return is_tailnet_ip(self.client_address[0])
 
@@ -1727,8 +1768,6 @@ def make_handler(ctx, me):
                 except Exception as e:
                     log("info failed:", type(e).__name__)
                     return self.reply(500, {"ok": False, "error": "info unavailable"})
-                if not self.accepts_requests:
-                    body["capabilities"] = []      # advertise only what this transport carries
                 return self.reply(200, body)
             if path.startswith("/requests/"):
                 ident = self.identify(fresh=True)
@@ -1863,8 +1902,6 @@ def make_handler(ctx, me):
             err = validate_env(env)
             if err:
                 return self.reply(400, {"ok": False, "error": err})
-            if not self.accepts_requests and ("request" in env or "response" in env):
-                return self.reply(501, {"ok": False, "error": "tracked requests are not carried over this transport yet"})
             if is_pull_request(env) and route == "/msg":
                 ident = self.identify(fresh=True)
                 if not ident or not self.authorize(ident):
@@ -2791,7 +2828,7 @@ class NumericHTTPServer(ThreadingHTTPServer):
 
 def cmd_serve(ctx, a):
     mode = ctx.cfg.get("relay", "off")
-    device = relay_module().Device(ctx.home) if mode != "off" else None
+    device = relay_device(ctx) if mode != "off" else None
     if mode != "only":
         me = ctx.self_node()
         ctx.receiver_identity = ReceiverIdentity(ctx, me)
@@ -2856,8 +2893,6 @@ def relay_handler(ctx, device):
     base = make_handler(ctx, device.node)
 
     class RelayFrame(base):
-        accepts_requests = False
-
         def __init__(self, request, sender, sender_key):
             self.sender, self.sender_key = sender, sender_key
             self.client_address, self.server, self.close_connection = ("relay:" + sender, 0), None, True
@@ -2898,7 +2933,7 @@ def relay_frame(ctx, device, handler, frame, slots):
             device.refuse(frame.get("frame_id") if isinstance(frame, dict) else None, exc.code)
             return
         route = (request["method"], urllib.parse.urlparse(request["path"]).path)
-        if route in RELAY_ROUTES:
+        if relay_route(*route):
             h = handler(request, sender, sender_key)
             h.handle_one_request()
             head, _, body = h.wfile.getvalue().partition(b"\r\n\r\n")
@@ -2952,6 +2987,51 @@ def relay_http_json(device, to_fqdn, method, path, body=None, timeout=15):
         return status, json.loads(raw)
     except Exception:
         return status, {"raw": raw[:200].decode("utf-8", "replace")}
+
+
+class TailscaleRoute(object):
+    """A request peer at its Tailscale address; identity checks ask LocalAPI who holds that address now."""
+    transport = "tailscale"
+
+    def __init__(self, ctx, peer, ip, port):
+        self.ctx, self.peer, self.ip, self.port = ctx, peer, ip, port
+
+    def identity(self, fresh=False):
+        return fresh_whois(self.ctx, self.ip) if fresh else self.ctx.whois(self.ip)
+
+    def self_node(self):
+        return self.ctx.self_node()
+
+    def json(self, method, path, body=None, **options):
+        return http_json(self.ip, self.port, method, path, body, host=self.peer, **options)
+
+
+class RelayRoute(object):
+    """A request peer on the relay; the key this machine trusts for it, read again on every check, is its
+    identity. There is no address or port."""
+    transport, ip, port = "relay", None, None
+
+    def __init__(self, ctx, peer, device):
+        self.ctx, self.peer, self.device = ctx, peer, device
+
+    def identity(self, fresh=False):
+        return relay_peer_ident(self.device, self.peer)
+
+    def self_node(self):
+        return relay_self_node(self.device)
+
+    def json(self, method, path, body=None, timeout=15, **options):
+        return relay_http_json(self.device, self.peer, method, path, body, timeout=timeout)
+
+
+def peer_route(ctx, peer, port):
+    """The route to a request peer stored in the ledger; a Tailscale name must still resolve to itself."""
+    if is_relay_name(peer):
+        return RelayRoute(ctx, peer, relay_device(ctx))
+    resolved, ip = ctx.resolve(peer)
+    if resolved != peer:
+        raise RuntimeError("request destination identity changed")
+    return TailscaleRoute(ctx, peer, ip, port)
 
 
 # ---------------------------------------------------------------- client
@@ -3181,14 +3261,15 @@ def discard_unsaved_pull_snapshots(ctx, mid, staged, saving):
     shutil.rmtree(staged, ignore_errors=True)
 
 
-def upload_request_file(ctx, env, item, ip, port, peer):
+def upload_request_file(ctx, env, item, route):
+    ip, port, peer = route.ip, route.port, route.peer
     source = ctx.home / "requests" / "sending" / env["id"] / item["token"]
     if (not source.is_file() or source.is_symlink() or source.stat().st_size != item["size"] or
             sha256_file(source) != item["sha256"]):
         raise ValueError("saved request attachment is missing or changed: " + item["name"])
     # Hashing a large snapshot takes time: check the pinned destination again right before connecting, so a
     # private input never goes to whoever holds the address now.
-    verify_pull_destination(ctx, env, peer, ip)
+    verify_pull_destination(ctx, env, route)
     connection = http.client.HTTPConnection(ip, port, timeout=30)
     try:
         with open(source, "rb") as stream:
@@ -3211,36 +3292,37 @@ def upload_request_file(ctx, env, item, ip, port, peer):
         connection.close()
 
 
-def verify_pull_destination(ctx, env, peer, ip):
+def verify_pull_destination(ctx, env, route):
     """The destination pinned when the request was saved, checked again before each new connection: the
-    address must still belong to that stable Tailscale identity and local policy must still allow it, and
-    this machine must still be the request's sender. Each upload and the final commit opens a new
-    connection, and the identity behind the address can change between them."""
-    identity = fresh_whois(ctx, ip)
-    if not identity or identity.get("node") != peer or not ctx.access_decision(identity)[0]:
+    address must still belong to that stable Tailscale identity (on the relay: the trusted key must be the
+    same) and local policy must still allow it, and this machine must still be the request's sender. Each
+    upload and the final commit opens a new connection, and the identity behind the address can change
+    between them."""
+    identity = route.identity(fresh=True)
+    if not identity or identity.get("node") != route.peer or not ctx.access_decision(identity)[0]:
         raise RuntimeError("request destination denied by local identity/access policy")
     with request_db(ctx) as db:
         saved = request_row(db, "outgoing", env["id"])
         pinned = json.loads(saved["record"] or "{}").get("peer_identity") if saved else None
     if pinned != peer_identity(identity):
         raise RuntimeError("request destination stable identity changed")
-    if stable_peer_id(ctx.self_node().get("stable_id")) != env["from"]:
+    if stable_peer_id(route.self_node().get("stable_id")) != env["from"]:
         raise RuntimeError("request sender stable identity changed")
 
 
-def submit_pull_request(ctx, env, peer, ip, port):
-    verify_pull_destination(ctx, env, peer, ip)
+def submit_pull_request(ctx, env, route):
+    verify_pull_destination(ctx, env, route)
     try:
-        status, prepared = http_json(ip, port, "POST", "/requests/prepare", env, host=peer)
+        status, prepared = route.json("POST", "/requests/prepare", env)
         if (status not in (200, 201) or not isinstance(prepared, dict) or prepared.get("ok") is not True or
                 prepared.get("id") != env["id"]):
             raise RuntimeError("request preparation not confirmed (HTTP %s): %s" %
                                (status, prepared.get("error", "invalid response") if isinstance(prepared, dict) else "invalid response"))
         if not prepared.get("committed"):
             for item in env["request"].get("uploads", []):
-                upload_request_file(ctx, env, item, ip, port, peer)   # checks the destination before connecting
-        verify_pull_destination(ctx, env, peer, ip)
-        status, body = http_json(ip, port, "POST", "/msg", env, host=peer)
+                upload_request_file(ctx, env, item, route)   # checks the destination before connecting
+        verify_pull_destination(ctx, env, route)
+        status, body = route.json("POST", "/msg", env)
     except (RuntimeError, OSError, ValueError) as exc:
         with request_db(ctx) as db:
             db.execute("UPDATE requests SET submission='unknown' WHERE direction='outgoing' AND id=?", (env["id"],))
@@ -3269,25 +3351,17 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     host, port = split_peer(addr, int(ctx.cfg["port"]))
     tracked = a.kind == "request" and not getattr(a, "legacy_request", False)
     pull = getattr(a, "transport", "push") == "pull"
-    device = None
     if is_relay_name(host):
-        # A relay device: no Tailscale lookup at all. Phase 1 carries messages only (docs/RELAY_DESIGN.md).
-        if tracked or pull:
-            die("tracked requests are not carried over a relay yet; send a message, or use --legacy-request")
+        # A relay device: no Tailscale lookup at all. Attachments wait for phase 3 (docs/RELAY_DESIGN.md).
         if getattr(a, "file", None):
             die("attachments are not carried over a relay yet")
-        device = relay_module().Device(ctx.home)
-        self_node = {"node": device.node}
-        to_fqdn, to_ip = device.canonical(host) + RELAY_SUFFIX, None
+        device = relay_device(ctx)
+        route = RelayRoute(ctx, device.canonical(host) + RELAY_SUFFIX, device)
     else:
-        self_node = ctx.self_node()
         to_fqdn, to_ip = ctx.resolve(host)
+        route = TailscaleRoute(ctx, to_fqdn, to_ip, port)
+    self_node, to_fqdn, exchange = route.self_node(), route.peer, route.json
     me = self_node["node"]
-
-    def exchange(method, path, body=None, **options):
-        if device is not None:
-            return relay_http_json(device, to_fqdn, method, path, body, timeout=options.get("timeout", 15))
-        return http_json(to_ip, port, method, path, body, host=to_fqdn, **options)
 
     if pull and not tracked:
         die("--transport pull requires a tracked request; it cannot be combined with --legacy-request")
@@ -3348,12 +3422,12 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
             if staged is not None:
                 request_db(ctx).close()      # exists before the save, so a failed save can be told from a commit
             saving = True
-            save_outgoing_request(ctx, env, to_fqdn, port)
+            save_outgoing_request(ctx, env, to_fqdn, port, route)
     except BaseException:
         discard_unsaved_pull_snapshots(ctx, msg_id, staged, saving)
         raise
     try:
-        status, resp = submit_pull_request(ctx, env, to_fqdn, to_ip, port) if pull else \
+        status, resp = submit_pull_request(ctx, env, route) if pull else \
             exchange("POST", "/msg", env)
     except (RuntimeError, OSError):
         if tracked:
@@ -3622,6 +3696,8 @@ def respond_with_files(ctx, rec, a, state):
     snapshot = request_snapshot(ctx.home, original["id"])
     if not snapshot:
         raise ValueError("no tracked incoming request with this ID")
+    if a.file and rec["received"]["peer"].get("transport") == "relay":
+        raise ValueError("attachments are not carried over a relay yet; reply with text only")
     envelope = {"id": original["id"], "from": snapshot["response"]["from"]}
     staged = prepare_attachments(ctx, a, envelope, rec["received"]["peer"]["node"],
                                  persistent_request=original["id"] if is_pull_request(original) else None)
@@ -3669,10 +3745,7 @@ def cmd_request(ctx, a):
             env, peer, port = json.loads(row["envelope"]), row["peer"], row["port"]
         if not is_pull_request(env):
             die("request resume is only supported for pull requests")
-        resolved, ip = ctx.resolve(peer)
-        if resolved != peer:
-            die("request destination identity changed")
-        status, response = submit_pull_request(ctx, env, peer, ip, port)
+        status, response = submit_pull_request(ctx, env, peer_route(ctx, peer, port))
         snapshot = request_snapshot(ctx.home, a.id, "outgoing")
         print(json.dumps({"id": a.id, "status": status, "response": response,
                           "submission": snapshot["submission"], "transport": "pull"}))
@@ -3704,10 +3777,9 @@ def cmd_request(ctx, a):
         if a.direction != "outgoing":
             die("--refresh is only for outgoing requests")
         try:
-            peer, ip = ctx.resolve(output["peer"])
-            if peer != output["peer"]:
-                raise RuntimeError("request destination identity changed")
-            identity = fresh_whois(ctx, ip) if output.get("transport") == "pull" else ctx.whois(ip)
+            route = peer_route(ctx, output["peer"], output["port"])
+            peer = route.peer
+            identity = route.identity(fresh=output.get("transport") == "pull")
             if not identity or identity.get("node") != peer or not ctx.access_decision(identity)[0]:
                 raise RuntimeError("request destination denied by local identity/access policy")
             if output.get("transport") == "pull":
@@ -3716,7 +3788,7 @@ def cmd_request(ctx, a):
                     pinned = json.loads(row["record"] or "{}").get("peer_identity")
                 if pinned != peer_identity(identity):
                     raise RuntimeError("request destination stable identity changed")
-            status, body = http_json(ip, output["port"], "GET", "/requests/" + a.id, host=peer, timeout=5)
+            status, body = route.json("GET", "/requests/" + a.id, timeout=5)
             if status != 200 or not isinstance(body, dict):
                 raise RuntimeError("receiver status unavailable (HTTP %s); outcome remains unknown" % status)
             remote_request = body.get("request")

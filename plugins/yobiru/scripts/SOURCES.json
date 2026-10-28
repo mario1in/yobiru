@@ -4,11 +4,11 @@
   "files": {
     "scripts/relay.py": {
       "source": "relay.py",
-      "sha256": "13c29f841ab9d55a7be9b478a21760d8d4ecc9ce71ec6eb3117842f8e76fac61"
+      "sha256": "f570fcd44a8f1d50ef9c27423c0e057cc4a8f459c38c57ca25ed82feaed9e423"
     },
     "scripts/tailmsg.py": {
       "source": "tailmsg.py",
-      "sha256": "e77d99673cca434e8e30b0702742703cf9bb575ad715e051ad2672dbf98793bb"
+      "sha256": "51ea71a55671678291445634b9a5bb1ee44bbe8f6c868f6babeced076c569aeb"
     },
     "scripts/codex_bridge/CODEX_DISPATCHER.md": {
       "source": "CODEX_DISPATCHER.md",

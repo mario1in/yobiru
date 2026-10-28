@@ -390,19 +390,20 @@ class RelayLoopbackTests(unittest.TestCase):
         replies = [x for x in self.inbox("alpha") if x["envelope"].get("reply_to") == mid]
         self.assertEqual(["bravo.relay"], [x["received"]["peer"]["node"] for x in replies])
 
-    def test_2_info_advertises_no_request_capability_and_requests_are_refused(self):
+    def status(self, who, mid, *extra):
+        return self.tm_json(who, "request", "status", mid, "--json", *extra)
+
+    def test_2_info_advertises_requests_and_attachments_are_still_refused(self):
         info = self.run_json(["--home", str(self.home["alpha"]), "relay", "info", "bravo"])
-        self.assertEqual((200, "bravo.relay", []), (info["status"], info["response"]["node"],
-                                                    info["response"]["capabilities"]))
+        self.assertEqual((200, "bravo.relay"), (info["status"], info["response"]["node"]))
+        self.assertLessEqual({"request-lifecycle-v1", "request-pull-v1"}, set(info["response"]["capabilities"]))
         before = len(self.inbox("bravo"))
-        r = self.tm("alpha", "request", "send", "bravo.relay/codex", "run the tests")
-        self.assertNotEqual(0, r.returncode)
-        self.assertIn("not carried over a relay", r.stderr)
         report = self.pkg.root / "notes.txt"
         report.write_text("notes")
-        r = self.tm("alpha", "send", "bravo.relay", "with a file", "--file", str(report))
-        self.assertNotEqual(0, r.returncode)
-        self.assertIn("attachments are not carried", r.stderr)
+        for args in (("send", "bravo.relay", "with a file"), ("request", "send", "bravo.relay/codex", "with a file")):
+            r = self.tm("alpha", *(args + ("--file", str(report))))
+            self.assertNotEqual(0, r.returncode)
+            self.assertIn("attachments are not carried", r.stderr)
         self.assertEqual(before, len(self.inbox("bravo")))
 
     def test_3_untrusting_a_sender_refuses_its_next_message(self):
@@ -414,6 +415,53 @@ class RelayLoopbackTests(unittest.TestCase):
             self.assertIn("peer_refused", r.stderr)
             self.assertNotIn("Delivery is unknown", r.stderr)
             self.assertEqual(before, len(self.inbox("bravo")))
+        finally:
+            fp = self.run_json(["--home", str(self.home["alpha"]), "relay", "whoami"])["fingerprint"]
+            self.run_ok(["--home", str(self.home["bravo"]), "relay", "trust", "alpha", "--fingerprint", fp])
+
+
+    def test_4_a_push_request_reports_its_receipt_start_and_result(self):
+        out = self.tm_json("alpha", "request", "send", "bravo.relay/codex", "run the tests", "--wake", "now")
+        self.assertEqual((202, "accepted", "bravo.relay"), (out["status"], out["submission"], out["to"]))
+        mid = out["id"]
+        self.assertTrue(wait_for(lambda: "codex %s" % mid in self.wakes()), self.wakes())
+        self.assertEqual("alpha.relay", self.status("bravo", mid, "--direction", "incoming")["peer"])
+        # bravo's receiver pushes each response back through the relay; alpha's receiver records it.
+        self.assertTrue(wait_for(lambda: self.status("alpha", mid)["state"] == "received", timeout=20))
+        self.tm_json("bravo", "request", "respond", mid, "started", "--state", "running")
+        self.assertTrue(wait_for(lambda: self.status("alpha", mid)["state"] == "running", timeout=20))
+        report = self.pkg.root / "results.txt"
+        report.write_text("all green")
+        r = self.tm("bravo", "reply", mid, "see the file", "--file", str(report))
+        self.assertNotEqual(0, r.returncode)
+        self.assertIn("attachments are not carried", r.stderr)
+        self.assertTrue(self.tm_json("bravo", "reply", mid, "all green")["queued"])
+        self.assertTrue(wait_for(lambda: self.status("alpha", mid)["state"] == "completed", timeout=20))
+        done = self.status("alpha", mid, "--refresh")
+        self.assertEqual(("ok", "completed", "all green", True),
+                         (done["refresh"], done["state"], done["response"]["text"], done["outcome_known"]))
+
+    def test_5_a_pull_request_result_waits_for_refresh(self):
+        out = self.tm_json("alpha", "request", "send", "bravo.relay/codex", "summarise the logs",
+                           "--transport", "pull")
+        self.assertEqual((202, "accepted", "pull"), (out["status"], out["submission"], out["transport"]))
+        mid = out["id"]
+        kid = relay.fingerprint_kid(self.run_json(["--home", str(self.home["alpha"]), "relay", "whoami"])["fingerprint"])
+        owner = "node:" + ("relay-" + kid).encode("ascii").hex()
+        self.assertEqual(owner, self.status("bravo", mid, "--direction", "incoming")["peer"])
+        resumed = self.tm_json("alpha", "request", "resume", mid)      # the same request again: a duplicate
+        self.assertEqual((200, "accepted"), (resumed["status"], resumed["submission"]))
+        self.assertTrue(self.tm_json("bravo", "reply", mid, "three warnings")["stored"])
+        self.assertNotIn(self.status("alpha", mid)["state"], ("received", "completed"))   # nothing is pushed
+        done = self.status("alpha", mid, "--refresh")
+        self.assertEqual(("ok", "completed", "three warnings"),
+                         (done["refresh"], done["state"], done["response"]["text"]))
+        # A sender whose key bravo no longer trusts cannot read the status, even with the request ID.
+        self.run_ok(["--home", str(self.home["bravo"]), "relay", "untrust", "alpha"])
+        try:
+            again = self.status("alpha", mid, "--refresh")
+            self.assertEqual("unavailable", again["refresh"])
+            self.assertIn("peer_refused", again["refresh_error"])
         finally:
             fp = self.run_json(["--home", str(self.home["alpha"]), "relay", "whoami"])["fingerprint"]
             self.run_ok(["--home", str(self.home["bravo"]), "relay", "trust", "alpha", "--fingerprint", fp])

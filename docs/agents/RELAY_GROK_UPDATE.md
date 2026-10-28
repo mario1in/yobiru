@@ -2,7 +2,8 @@
 
 你在 Grok Bot 这个对话的电脑上工作，这里已经装了 Yobiru 0.7.15，并通过 Tailscale 和用户家里的 Mac mini 通信。
 目标：更新到用户 fork 的 `main`（支持自托管中继），在保留现有 Tailscale 通路的同时，经中继和用户公司的 Mac
-（中继名 `work-mini`，不装 Tailscale）互通。中继只转发消息：第 1 阶段不支持 tracked request（`request send`）和附件。
+（中继名 `work-mini`，不装 Tailscale）互通。消息、wake 和 tracked request（`request send`，push 与 pull）都能走中继；
+附件还不能（第 3 阶段）。
 
 先读 `yobiru-grok-bot` skill：其中关于 data home、持久目录、启动定义和备份的规则在这里全部适用。
 
@@ -111,10 +112,14 @@ sh "$Y" --home "$HOME_T" wake-config --peer-max work-mini.relay=now --apply
 ```sh
 sh "$Y" --home "$HOME_T" relay directory          # work-mini: trusted, online: true
 sh "$Y" --home "$HOME_T" relay ping work-mini     # "status": 200
-sh "$Y" --home "$HOME_T" relay info work-mini     # capabilities: [], agents 里有 codex
+sh "$Y" --home "$HOME_T" relay info work-mini     # capabilities 含 request-lifecycle-v1，agents 里有 codex
 sh "$Y" --home "$HOME_T" send work-mini.relay/codex "验收：请回复 ok" --wake now   # "status": 202
 sh "$Y" --home "$HOME_T" inbox                    # 稍后应有来自 work-mini.relay 的回复
+sh "$Y" --home "$HOME_T" request send work-mini.relay/codex "验收：请回复 ok" --wake now   # "submission": "accepted"
+sh "$Y" --home "$HOME_T" request status 请求ID     # 几秒内 state=received；公司 Mac 回复后为 completed
 ```
+
+push request 的回执和结果由公司 Mac 推回给你，所以要第 5 步打开了 `"relay": "on"`、接收端在运行。
 
 `peer_offline` 表示公司 Mac 没在运行或在睡眠；`peer_refused: sender_not_trusted` 表示公司 Mac 还没信任你。
 
@@ -122,7 +127,8 @@ sh "$Y" --home "$HOME_T" inbox                    # 稍后应有来自 work-mini
 
 - 发给中继设备（`NAME.relay`）时，一律用新源码里的 `$Y`。已安装的 0.7.15 插件和它的 skill 调用的是旧 CLI，不认识
   `NAME.relay` 地址。发给 Tailscale 上的设备照旧。
-- 中继上还不能用 `request send`，也不能带附件；会被明确拒绝。
+- 中继上可以用 `request send`（push 或 `--transport pull`）、`request status --refresh` 和 `request resume`；
+  还不能带附件，带 `--file` 会被明确拒绝。
 - 更新：`git -C /workspace/yobiru-src pull --ff-only`，再 `install-runtime --upgrade --apply`，然后重启接收端。
 
 ## 回滚

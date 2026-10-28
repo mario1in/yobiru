@@ -1,8 +1,14 @@
 # 自托管中继：把 tailnet 搬到 HTTPS 上（设计草案）
 
-**状态：第 1 阶段已实现（预览）**：中继服务端、设备登记与信任、帧封装，`/health`、`/info`、`/msg` 与 wake
-（`relay.py`、`tests/test_relay.py`）。第 2–4 阶段尚未实现；在那之前，tracked request 和附件走中继时会被明确拒绝。部署步骤见
+**状态：第 1–2 阶段已实现（预览）**：中继服务端、设备登记与信任、帧封装，`/health`、`/info`、`/msg` 与 wake；
+push 与 pull request、响应投递、`request status --refresh`、`request resume`（`relay.py`、`tests/test_relay.py`）。
+第 3–4 阶段尚未实现；在那之前，附件走中继时会被明确拒绝（发送、pull 上传和带文件的结果都是）。部署步骤见
 [RELAY_DEPLOY.zh-CN.md](RELAY_DEPLOY.zh-CN.md)。
+
+第 2 阶段的实现：中继帧额外放行 `POST /requests/prepare` 和 `GET /requests/<id>`；发送方的 request 路径经
+`TailscaleRoute` 或 `RelayRoute`（`tailmsg.py`）选择传输，后者用本机当前信任的对方密钥代替 whois 做身份校验；
+接收端维护线程把 push 响应经中继投递给 `NAME.relay` 的发送方。pull request 的发送方身份是 `relay-<kid>` 这个
+StableID，换了密钥就是另一个发送方。
 本文描述一种新的传输方式：设备只需出站 HTTPS，经过所有者自己托管的中继
 （relay）交换现有的 tailmsg protocol v1 流量。目标场景是同一所有者的设备之间通信，其中一部分设备不能安装
 Tailscale（例如公司电脑）。Tailscale 传输保持不变，仍是默认。

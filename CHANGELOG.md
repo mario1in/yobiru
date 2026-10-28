@@ -6,14 +6,19 @@
   messages through a relay you host, over outbound HTTPS and without Tailscale. Frames are sealed for the receiver
   and authenticated by the sender's key; a device talks only to peers whose fingerprints it trusted explicitly, and
   the relay stores no messages. Devices appear as `NAME.relay`; set `"relay": "on"` or `"only"` in `config.json`
-  to receive. Phase 1 carries `/health`, `/info` and `/msg` with wake; tracked requests and attachments are
-  refused over a relay for now. Tailscale names ending in `.relay` are refused. See `docs/RELAY_DESIGN.md`.
+  to receive. Phase 1 carries `/health`, `/info` and `/msg` with wake. Tailscale names ending in `.relay` are
+  refused. See `docs/RELAY_DESIGN.md`.
 - **Relay runtime and doctor.** `install-runtime` writes `relay.py` and `public_bots/bot_e2e.py` next to the
   receiver runtime, also when the runtime is already current. `doctor` skips Tailscale and the local port for
   `"relay": "only"` and checks the relay enrollment, trust, relay server and the runtime's relay files instead.
   Deployment: `docs/RELAY_DEPLOY.zh-CN.md`.
 - **Relay container.** `deploy/relay/Dockerfile` runs the relay as a non-root container that initializes its
   state on a persistent `/data` volume on first start (for example on Coolify); agent guides are in `docs/agents/`.
+- **Tracked requests over the relay (phase 2).** `request send` to a `NAME.relay` device works with push and pull:
+  the receiver pushes `received`, `running` and the result back through the relay (the sender's receiver must have
+  `"relay"` on), and `request status --refresh` and `request resume` reach relay devices. A relay pull request is
+  owned by the sender's key (`relay-<kid>`). Attachments, including pull uploads and result files, are still
+  refused over a relay.
 
 ## 0.7.15 (2026-10-26)
 
