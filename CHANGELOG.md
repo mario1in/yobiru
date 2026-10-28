@@ -8,6 +8,10 @@
   the relay stores no messages. Devices appear as `NAME.relay`; set `"relay": "on"` or `"only"` in `config.json`
   to receive. Phase 1 carries `/health`, `/info` and `/msg` with wake; tracked requests and attachments are
   refused over a relay for now. Tailscale names ending in `.relay` are refused. See `docs/RELAY_DESIGN.md`.
+- **Relay runtime and doctor.** `install-runtime` writes `relay.py` and `public_bots/bot_e2e.py` next to the
+  receiver runtime, also when the runtime is already current. `doctor` skips Tailscale and the local port for
+  `"relay": "only"` and checks the relay enrollment, trust, relay server and the runtime's relay files instead.
+  Deployment: `docs/RELAY_DEPLOY.zh-CN.md`.
 
 ## 0.7.15 (2026-10-26)
 

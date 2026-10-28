@@ -49,21 +49,16 @@ sh "$Y" relay --help
 
 公司网络不能访问 GitHub 时，从家里把整个源码目录打包，再复制过去。
 
-### 已知问题：常驻运行时缺少 relay 文件
+### 常驻运行时和 relay 文件
 
-接收服务（`service-template` 生成的 launchd/systemd 定义）运行的是 data home 里的那份 `tailmsg.py`（由
-`install-runtime` 复制）。中继模式还需要旁边的 `relay.py` 和 `public_bots/bot_e2e.py`，但 `install-runtime`
-目前只复制 `tailmsg.py`。缺了这两个文件，打开 `"relay"` 的接收端**启动即失败**。在修好之前，每台要接收中继
-消息的设备都要手动补齐（每次 `install-runtime --upgrade` 之后都要再做一遍）：
+接收服务（`service-template` 生成的 launchd/systemd 定义）运行的是 data home 里的那份 `tailmsg.py`。中继模式
+还要用到它旁边的 `relay.py` 和 `public_bots/bot_e2e.py`；`install-runtime --apply`（或 `--upgrade --apply`）会把
+它们和 `tailmsg.py` 一起写进 data home，运行时已是最新时也会补上缺的文件。`doctor` 会在缺文件时报
+`relay-runtime` 错误。
 
-```sh
-S="$(dirname "$Y")"
-cp "$S/relay.py" "$HOME_T/relay.py"
-mkdir -p "$HOME_T/public_bots" && cp "$S/public_bots/bot_e2e.py" "$HOME_T/public_bots/bot_e2e.py"
-```
-
-**顺序很重要：** 先补齐文件、先 `relay join`，最后才在 `config.json` 里打开 `"relay"`。对已有的 Tailscale
-接收端（家里 Mac mini、Grok bot）来说，反过来做会让它下次重启时直接起不来。
+**顺序很重要：** 先 `install-runtime`、先 `relay join`，最后才在 `config.json` 里打开 `"relay"`。打开了却没登记，
+或者运行时旁边缺 relay 文件，接收端会拒绝启动；对已有的 Tailscale 接收端（家里 Mac mini、Grok bot）来说，这意味着
+原来的 Tailscale 通路也一起停了。打开之前先运行 `doctor`，确认没有 `relay` 和 `relay-runtime` 错误。
 
 ## 2. 东京服务器：中继
 
@@ -145,8 +140,7 @@ relay_admin server devices --relay-home /var/lib/yobiru-relay
 ```sh
 HOME_T="$HOME/.tailmsg"
 sh "$Y" --home "$HOME_T" setup --agent codex --self-agent codex --default-agent codex --apply
-sh "$Y" --home "$HOME_T" install-runtime --apply
-# 补齐 relay 文件（第 1 节的三行）
+sh "$Y" --home "$HOME_T" install-runtime --apply                    # 连同 relay 文件
 sh "$Y" --home "$HOME_T" relay join https://relay.example.com --name work-mini --invite 邀请码
 sh "$Y" --home "$HOME_T" relay whoami        # 记下 fingerprint，第 6 节要用
 ```
@@ -174,8 +168,8 @@ tail -n 5 "$HOME_T/serve.log"     # 应有 "serving work-mini.relay through the 
 
 在「系统设置 → 能源」里打开「防止自动进入睡眠」：Mac 睡眠时收不到消息，发送方会看到 `peer_timeout` 或 `peer_offline`。
 
-`yobiru doctor` 目前还不认识中继模式，会把 Tailscale 缺失和接收端不可达报成问题。在公司 Mac 上可以忽略这两项，
-改用第 7 节的 `relay ping` 检查。
+检查：`sh "$Y" --home "$HOME_T" doctor`。`"relay": "only"` 时它不检查 Tailscale 和本机端口，改为检查中继登记、
+信任、relay 文件和中继服务器；`relay-trust` 在第 6 节完成之前会是 warn。对方能否收到，用第 7 节的 `relay ping` 确认。
 
 ## 4. Grok bot 的电脑：Tailscale 加中继
 
@@ -185,8 +179,7 @@ data home 和启动方式，不要另建。源码放在能保留下来的目录�
 ```sh
 git clone https://github.com/mario1in/yobiru.git /workspace/yobiru-src     # 或复制
 Y=/workspace/yobiru-src/plugins/yobiru/scripts/yobiru
-sh "$Y" --home "$HOME_T" install-runtime --upgrade --apply            # 旧运行时会留一份备份
-# 补齐 relay 文件（第 1 节的三行）
+sh "$Y" --home "$HOME_T" install-runtime --upgrade --apply            # 连同 relay 文件；旧运行时留一份备份
 sh "$Y" --home "$HOME_T" relay join https://relay.example.com --name grok --invite 邀请码
 sh "$Y" --home "$HOME_T" relay whoami
 ```
@@ -197,7 +190,7 @@ Tailscale 通路仍然正常（`sh "$Y" --home "$HOME_T" doctor`）。Grok 发�
 
 ## 5. 家里 Mac mini（可选）
 
-和 Grok bot 一样，保留 Tailscale：`install-runtime --upgrade --apply`，补齐 relay 文件，`relay join --name
+和 Grok bot 一样，保留 Tailscale：`install-runtime --upgrade --apply`，`relay join --name
 home-mini`，`config.json` 加 `"relay": "on"`，然后重启：
 
 ```sh
@@ -257,7 +250,7 @@ sh "$Y" --home "$HOME_T" relay untrust work-mini                  # 每台信任
 **重新登记**（重装后）：吊销旧的，发新邀请，在新设备上 `join`，再按第 6 节重新核对指纹并 `trust`。旧的
 `relay/device.json` 不会被覆盖：`join` 发现已有登记会拒绝。
 
-**升级：** `git pull` 后运行 `install-runtime --upgrade --apply`，**再次补齐 relay 文件**，然后重启接收端。服务器上
+**升级：** `git pull` 后运行 `install-runtime --upgrade --apply`（relay 文件会一起更新），然后重启接收端。服务器上
 `git pull` 后执行 `sudo systemctl restart yobiru-relay`；重启会断开正在进行的交换，发送方会看到一次失败。
 
 **备份：** 服务器只需备份 `/var/lib/yobiru-relay`（设备登记表）。设备上的 `HOME_T/relay/` 存有私钥和凭证
@@ -268,7 +261,7 @@ sh "$Y" --home "$HOME_T" relay untrust work-mini                  # 每台信任
 | 报错 | 原因与处理 |
 |---|---|
 | `not_joined` | 这个 data home 还没 `relay join`；接收端打开了 `"relay"` 却没登记也会这样 |
-| `No such file or directory: .../relay.py` | 常驻运行时旁边缺 relay 文件，见第 1 节 |
+| `No such file or directory: .../relay.py` | 常驻运行时旁边缺 relay 文件：`install-runtime --apply`，再重启 |
 | `not_trusted` | 本机还没信任对方，见第 6 节 |
 | `peer_refused: sender_not_trusted` | 对方没信任你，或已 `untrust` |
 | `peer_refused: clock_skew` | 两台设备的时钟差超过 5 分钟；打开系统自动校时 |
@@ -282,7 +275,7 @@ sh "$Y" --home "$HOME_T" relay untrust work-mini                  # 每台信任
 ## 9. 已知限制（第 1 阶段）
 
 - 只转发 `/health`、`/info`、`/msg`。tracked request 和附件会被拒绝，Grok 还不能通过中继拿到 `running` 和最终结果。
-- `install-runtime` 不复制 relay 文件，`doctor` 不识别中继模式。
+- `doctor` 只检查本机的中继登记、信任、relay 文件和中继服务器；对方能否收到，要用 `relay ping` 确认。
 - 接收端重启后的 5 分钟内，中继可以把重启前的帧重放一次；`/msg` 按消息 ID 去重，所以不会产生重复消息。
 - 中继能看到哪台设备在何时和哪台设备通信、数据多大，看不到内容。
 - 中继是单点：它停了，只走中继的公司 Mac 就失联；Tailscale 设备之间不受影响。

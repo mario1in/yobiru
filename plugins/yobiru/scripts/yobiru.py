@@ -415,6 +415,46 @@ def inbox_stats(home, default_agent):
 
 
 # ---------------------------------------------------------------- facts shared by doctor/status/paths
+_relay = None
+
+
+def relay_module():
+    """The bundled relay.py as a module (definitions only), for read-only relay checks."""
+    global _relay
+    if _relay is None:
+        spec = importlib.util.spec_from_file_location("yobiru_bundled_relay", str(HERE / "relay.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _relay = mod
+    return _relay
+
+
+def relay_facts(home, mode, probe):
+    """Relay enrollment, trust and runtime relay files of this home; None when it neither joined nor uses a relay."""
+    if mode == "off" and not (home / "relay" / "device.json").is_file():
+        return None
+    r = {"mode": mode, "joined": False, "trusted": [], "companions": None, "server": None}
+    if (home / "tailmsg.py").is_file():
+        r["companions"] = companion_status(home)
+    relay = relay_module()
+    try:
+        device = relay.Device(home)
+    except relay.RelayError:
+        return r
+    except Exception as e:
+        r["error"] = "cannot read %s: %s" % (home / "relay" / "device.json", type(e).__name__)
+        return r
+    r.update(joined=True, name=device.name, node=device.node, url=device.url, trusted=sorted(device.trusted()))
+    if probe:
+        try:
+            status, body = device.call("GET", "/v1/health", timeout=5)
+            r["server"] = {"reachable": status == 200, "http_status": status,
+                           "relay_id_matches": body.get("relay_id") == device.relay_id}
+        except relay.RelayError as e:
+            r["server"] = {"reachable": False, "error": str(e)}
+    return r
+
+
 def gather(home, home_source, probe=True):
     f = {"product": PRODUCT, "plugin_version": plugin_version(), "plugin_root": str(PLUGIN_ROOT),
          "core": str(CORE), "core_present": CORE.is_file(),
@@ -460,7 +500,8 @@ def gather(home, home_source, probe=True):
                 entry["checks"] = [("error", str(e))]
             f["adapters"].append(entry)
         f["inbox"] = inbox_stats(home, cfg.get("default_agent"))
-    ts = {"cmd": None, "found": None, "error": None, "probed": False}
+    relay_mode = (cfg or {}).get("relay", "off")
+    ts = {"cmd": None, "found": None, "error": None, "probed": False, "relay_only": relay_mode == "only"}
     cmd = (cfg or {}).get("tailscale_cmd") or ["tailscale"]
     if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) and x for x in cmd):
         ts["error"] = "tailscale_cmd in config.json must be a non-empty list of strings"
@@ -469,7 +510,7 @@ def gather(home, home_source, probe=True):
         ts["found"] = find_exe(cmd[0])
         if not ts["found"]:
             ts["error"] = "%s not found" % cmd[0]
-        elif probe:
+        elif probe and relay_mode != "only":       # a relay-only receiver does not use Tailscale at all
             ts["probed"] = True
             out, e = run_tailscale(cmd, ["status", "--json"])
             if e:
@@ -490,7 +531,8 @@ def gather(home, home_source, probe=True):
                 except (ValueError, AttributeError):
                     ts["shields_up"] = None
     f["tailscale"] = ts
-    if probe and cfg is not None:
+    f["relay"] = relay_facts(home, relay_mode, probe) if cfg is not None else None
+    if probe and cfg is not None and relay_mode != "only":
         host = cfg.get("bind") or next((i for i in ts.get("ips") or [] if ":" not in i), None)
         f["receiver"] = probe_health(host, f["port"], peer=ts.get("node")) if host else {"reachable": False,
                                                                      "error": "no Tailscale IPv4 address"}
@@ -536,6 +578,47 @@ def cmd_paths(home, home_source, argv):
     return 0
 
 
+def relay_check(f, add):
+    r = f.get("relay")
+    if not r:
+        return
+    if r.get("error"):
+        add("error", "relay", r["error"], "fix or move that file by hand; %s never overwrites it" % PRODUCT)
+    elif not r["joined"]:
+        add("error", "relay", "config relay is %s but this home has not joined a relay" % r["mode"],
+            "`%s relay join URL --name NAME --invite CODE`, with an invite from `relay server invite` on the relay "
+            "host" % PRODUCT)
+    else:
+        detail = "%s through %s (config relay: %s)" % (r["node"], r["url"], r["mode"])
+        if r["mode"] == "off":
+            add("info", "relay", detail + "; joined but not receiving through it",
+                'to receive: "relay": "on" (with Tailscale) or "only" in config.json, then restart the receiver')
+        else:
+            add("ok", "relay", detail)
+        add("ok" if r["trusted"] else "warn", "relay-trust",
+            "trusts: %s" % (", ".join(n + ".relay" for n in r["trusted"]) or "nobody"),
+            None if r["trusted"] else "compare fingerprints on each device (`%s relay whoami`), then "
+            "`%s relay trust NAME --fingerprint FP`" % (PRODUCT, PRODUCT))
+        server = r.get("server")
+        if server is not None and server.get("reachable") and server.get("relay_id_matches"):
+            add("ok", "relay-server", "%s answers" % r["url"])
+        elif server is not None and server.get("reachable"):
+            add("error", "relay-server", "%s is not the relay this device joined" % r["url"],
+                "check the URL and DNS; join another relay only after revoking this enrollment")
+        elif server is not None:
+            add("warn", "relay-server", "%s: %s" % (r["url"], server.get("error") or "HTTP %s" % server.get("http_status")),
+                "check DNS, the certificate, a company proxy, and `systemctl status yobiru-relay` on the relay host")
+    stale = [c["name"] for c in r.get("companions") or [] if c["state"] != "current"]
+    if r["mode"] != "off" and stale:
+        add("error", "relay-runtime", "missing or different next to %s/tailmsg.py: %s; the receiver cannot start in "
+            "relay mode" % (f["home"], ", ".join(stale)),
+            "`%s install-runtime --apply` (`--upgrade --apply` for an older runtime), then restart the receiver"
+            % PRODUCT)
+    if r["mode"] == "only":
+        add("info", "receiver", "relay only: no local port to probe; from another device run `%s relay ping %s`"
+            % (PRODUCT, r.get("name") or "NAME"))
+
+
 def doctor_checks(f):
     checks = []
 
@@ -571,7 +654,9 @@ def doctor_checks(f):
     ts = f["tailscale"]
     state = classify_tailscale(ts)
     linux = sys.platform.startswith("linux")
-    if ts.get("cmd") is None:
+    if ts.get("relay_only"):
+        add("info", "tailscale", 'not used: config.json sets "relay": "only"')
+    elif ts.get("cmd") is None:
         add("error", "tailscale", ts["error"], "fix tailscale_cmd in config.json by hand, or use "
             "`%s setup --tailscale-cmd PATH --replace tailscale_cmd`" % PRODUCT)
     elif state == "missing":
@@ -632,6 +717,7 @@ def doctor_checks(f):
                 (r.get("url", "-"), r.get("error")),
                 "to receive messages run the receiver as a service: `%s install-runtime`, then install "
                 "the definition printed by `%s service-template ...`" % (PRODUCT, PRODUCT))
+    relay_check(f, add)
     maintenance_check(f, add)
     backlog_check(f, add)
     dispatcher_check(f, add)
@@ -1524,6 +1610,21 @@ def _described(adapter):
 
 
 # ---------------------------------------------------------------- runtime + services
+RUNTIME_COMPANIONS = ("relay.py", "public_bots/bot_e2e.py")   # loaded next to <home>/tailmsg.py for a relay
+
+
+def companion_status(home):
+    """[{name, path, state}] for each relay file the runtime loads from its own folder: absent, current, different."""
+    out = []
+    for name in RUNTIME_COMPANIONS:
+        src, dst = HERE / name, home / name
+        if not src.is_file():
+            die("bundled %s is missing; reinstall the plugin" % name, 2)
+        state = "absent" if not dst.is_file() else "current" if sha256_file(dst) == sha256_file(src) else "different"
+        out.append({"name": name, "path": str(dst), "state": state})
+    return out
+
+
 def cmd_install_runtime(home, home_source, argv):
     ap = argparse.ArgumentParser(allow_abbrev=False,
         prog=PRODUCT + " install-runtime",
@@ -1580,6 +1681,21 @@ def cmd_install_runtime(home, home_source, argv):
         os.replace(str(tmp), str(target))
         res["written"] = True
         res["next"] = "restart the receiver service if one is running (%s never restarts services)" % PRODUCT
+    # The relay files travel with the runtime they belong to: written whenever tailmsg.py is (or already is) the
+    # bundled copy, never next to a runtime this command refused to replace.
+    res["companions"] = companion_status(home)
+    if a.apply and res["action"] != "refused":
+        for item in res["companions"]:
+            if item["state"] == "current":
+                continue
+            dst = Path(item["path"])
+            dst.parent.mkdir(exist_ok=True)
+            tmp = dst.with_name(".%s.%s-%d.tmp" % (dst.name, PRODUCT, os.getpid()))
+            shutil.copyfile(str(HERE / item["name"]), str(tmp))
+            os.chmod(str(tmp), 0o644)
+            os.replace(str(tmp), str(dst))
+            item["state"] = "written"
+            res["next"] = "restart the receiver service if one is running (%s never restarts services)" % PRODUCT
     if a.apply and res["action"] != "refused":
         request_dir.mkdir(mode=0o700, exist_ok=True)
     if a.json:
@@ -1590,6 +1706,12 @@ def cmd_install_runtime(home, home_source, argv):
                                                "" if res["written"] or res["action"] in ("none", "refused")
                                                else " (dry run; add --apply)"))
         print("  versions: existing %s, bundled %s" % (res["existing_version"] or "-", res["bundled_version"] or "-"))
+        pending = [c["name"] for c in res["companions"] if c["state"] not in ("current", "written")]
+        written = [c["name"] for c in res["companions"] if c["state"] == "written"]
+        if written:
+            print("  relay files written: %s" % ", ".join(written))
+        elif pending and res["action"] != "refused":
+            print("  relay files to write: %s%s" % (", ".join(pending), "" if a.apply else " (dry run; add --apply)"))
         for k in ("error", "backup", "next"):
             if res.get(k):
                 print("  %s: %s" % (k, res[k]))

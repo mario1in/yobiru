@@ -210,6 +210,66 @@ class TailmsgRelayIdentityTests(unittest.TestCase):
             core.parse_config({"relay": "maybe"})
 
 
+class RelayRuntimeAndDoctorTests(unittest.TestCase):
+    """install-runtime carries the relay files with the runtime; doctor checks a relay-only home without Tailscale."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pkg = Package()
+        cls.user = cls.pkg.new_home("runtime user")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pkg.cleanup()
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(dir=str(self.pkg.root), prefix="home "))
+        (self.home / "config.json").write_text(json.dumps({"relay": "only"}))
+
+    def run_json(self, *args):
+        r = self.pkg.run(["--home", str(self.home)] + list(args) + ["--json"], self.user)
+        return r, json.loads(r.stdout)
+
+    def companions(self, res):
+        return {c["name"]: c["state"] for c in res["companions"]}
+
+    def test_install_runtime_writes_the_relay_files_with_the_runtime(self):
+        scripts = self.pkg.plugin / "scripts"
+        r, res = self.run_json("install-runtime")
+        self.assertEqual({"relay.py": "absent", "public_bots/bot_e2e.py": "absent"}, self.companions(res))
+        self.assertFalse((self.home / "relay.py").exists(), "a dry run writes nothing")
+        r, res = self.run_json("install-runtime", "--apply")
+        self.assertEqual((0, "install"), (r.returncode, res["action"]))
+        self.assertEqual({"relay.py": "written", "public_bots/bot_e2e.py": "written"}, self.companions(res))
+        for name in ("relay.py", "public_bots/bot_e2e.py"):
+            self.assertEqual((scripts / name).read_bytes(), (self.home / name).read_bytes())
+        (self.home / "relay.py").unlink()            # an already current runtime still gets a missing relay file
+        r, res = self.run_json("install-runtime", "--apply")
+        self.assertEqual(("none", "written", "current"), (res["action"], self.companions(res)["relay.py"],
+                                                          self.companions(res)["public_bots/bot_e2e.py"]))
+
+    def test_a_refused_runtime_gets_no_relay_files(self):
+        (self.home / "tailmsg.py").write_text("# a different running receiver\n")
+        r, res = self.run_json("install-runtime", "--apply")
+        self.assertEqual((1, "refused"), (r.returncode, res["action"]))
+        self.assertFalse((self.home / "relay.py").exists())
+
+    def test_doctor_checks_a_relay_only_home_without_tailscale(self):
+        (self.home / "tailmsg.py").write_bytes(self.pkg.core.read_bytes())       # runtime without its relay files
+        r, res = self.run_json("doctor")
+        checks = {c["check"]: c for c in res["checks"]}
+        self.assertEqual("info", checks["tailscale"]["status"])
+        self.assertIn("not used", checks["tailscale"]["detail"])
+        self.assertEqual("info", checks["receiver"]["status"])
+        self.assertEqual("error", checks["relay"]["status"])
+        self.assertIn("relay join", checks["relay"]["fix"])
+        self.assertEqual("error", checks["relay-runtime"]["status"])
+        self.assertIn("install-runtime", checks["relay-runtime"]["fix"])
+        self.pkg.run(["--home", str(self.home), "install-runtime", "--apply"], self.user)
+        r, res = self.run_json("doctor")
+        self.assertNotIn("relay-runtime", [c["check"] for c in res["checks"]])
+
+
 class RelayLoopbackTests(unittest.TestCase):
     """alpha and bravo talk only through the relay: no tailscale on PATH, no listening receiver port."""
 
@@ -242,8 +302,12 @@ class RelayLoopbackTests(unittest.TestCase):
               for name in cls.home}
         cls.run_ok(["--home", str(cls.home["alpha"]), "relay", "trust", "bravo", "--fingerprint", fp["bravo"]])
         cls.run_ok(["--home", str(cls.home["bravo"]), "relay", "trust", "alpha", "--fingerprint", fp["alpha"]])
-        for name in cls.home:
-            cls.start(["--home", str(cls.home[name]), "serve"], name)
+        # alpha runs the bundled tailmsg.py; bravo runs like a service: the runtime install-runtime copied into
+        # its data home, with the relay files next to it.
+        cls.start(["--home", str(cls.home["alpha"]), "serve"], "alpha")
+        cls.run_ok(["--home", str(cls.home["bravo"]), "install-runtime", "--apply"])
+        cls.start([str(cls.home["bravo"] / "tailmsg.py"), "--home", str(cls.home["bravo"]), "serve"], "bravo",
+                  launcher=False)
         for name, peer in (("alpha", "bravo"), ("bravo", "alpha")):
             if not wait_for(lambda: cls.ping(name, peer) == 200, timeout=20):
                 cls.tearDownClass()
@@ -280,9 +344,10 @@ class RelayLoopbackTests(unittest.TestCase):
         return r.returncode == 0
 
     @classmethod
-    def start(cls, args, name):
+    def start(cls, args, name, launcher=True):
         log = open(str(cls.pkg.root / ("%s.log" % name)), "w")
-        cls.procs.append(subprocess.Popen(["/bin/sh", str(cls.pkg.launcher)] + args, env=cls.pkg.env(cls.user),
+        cmd = ["/bin/sh", str(cls.pkg.launcher)] if launcher else [sys.executable]
+        cls.procs.append(subprocess.Popen(cmd + args, env=cls.pkg.env(cls.user),
                                           cwd=str(cls.pkg.work), stdout=log, stderr=subprocess.STDOUT,
                                           start_new_session=True))
         log.close()
