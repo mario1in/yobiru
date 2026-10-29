@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Claude bridge keeps dispatching when Claude picks its own session ID.** Claude Code 2.1.216 ignores
+  `--session-id` for `claude --bg`, so every launch stayed `uncertain` and blocked all later wake-ups until an
+  operator reconciled it by hand. The bridge now also accepts exactly one listed session with the launch's
+  name, workdir and start window that no other run claimed (recorded as `observed_session_id`), which also
+  settles an existing stuck run on the next cycle. Ambiguous matches still stay `uncertain`.
 - **Self-hosted relay (preview, phase 1).** Add `relay.py` and `yobiru relay`: your own devices exchange tailmsg
   messages through a relay you host, over outbound HTTPS and without Tailscale. Frames are sealed for the receiver
   and authenticated by the sender's key; a device talks only to peers whose fingerprints it trusted explicitly, and

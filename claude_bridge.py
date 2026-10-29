@@ -3,7 +3,9 @@
 
 The inbox and request ledger remain authoritative. This adapter records intent
 before launch, never retries uncertain launches, never acknowledges messages,
-and never stops sessions. Only exact persisted session UUIDs are reconciled.
+and never stops sessions. A launch is reconciled by its persisted session UUID or,
+when Claude assigns its own ID to a background session, by its unique name, workdir
+and start time.
 """
 import argparse
 import contextlib
@@ -215,15 +217,34 @@ class Bridge:
             return None
         return value if isinstance(value, list) and all(isinstance(a, dict) for a in value) else None
 
+    def run_name(self, run):
+        return run.get("name") or "Yobiru %s %s" % (self.cfg["agent"], run["ids"][0][:8])
+
+    def observed(self, sid, run, agents, claimed):
+        exact = [a for a in agents if a.get("sessionId") == sid]
+        if exact:
+            return exact
+        # `claude --bg` may ignore --session-id and assign its own; fall back to the
+        # launch's unique name in this workdir, started within the launch window.
+        start = run["created_at"] * 1000 - 5000
+        end = (run["created_at"] + float(self.cfg["command_timeout"]) + 60) * 1000
+        return [a for a in agents if a.get("name") == self.run_name(run)
+                and a.get("cwd") == self.cfg["workdir"] and a.get("sessionId") not in claimed
+                and isinstance(a.get("startedAt"), (int, float)) and start <= a["startedAt"] <= end]
+
     def reconcile(self, state):
         waiting = [(sid, run) for sid, run in state["runs"].items() if run["phase"] in ("intent", "uncertain")]
         if not waiting:
             return
         agents = self.agents()
+        claimed = {r.get("observed_session_id") or s for s, r in state["runs"].items() if r["phase"] == "dispatched"}
         for sid, run in waiting:
-            matches = [a for a in agents or [] if a.get("sessionId") == sid]
+            matches = self.observed(sid, run, agents or [], claimed)
             if len(matches) == 1 and isinstance(matches[0].get("id"), str) and matches[0]["id"]:
                 run.update(phase="dispatched", background_id=matches[0]["id"], reconciled_at=time.time())
+                if matches[0].get("sessionId") != sid:
+                    run.update(observed_session_id=matches[0].get("sessionId"), matched_by="name")
+                claimed.add(matches[0].get("sessionId"))
             else:
                 run.update(phase="uncertain", reason="session_lookup_unavailable" if agents is None else "session_not_uniquely_observed")
         self.save(state)
@@ -261,9 +282,9 @@ class Bridge:
         if not ids:
             return {"state": "idle", "detail": "messages settled before launch"}
         sid = str(uuid.uuid4())
-        state["runs"][sid] = {"ids": ids, "phase": "intent", "created_at": time.time()}
-        self.save(state)  # fsync intent and directory before invoking Claude
         name = "Yobiru %s %s" % (self.cfg["agent"], ids[0][:8])
+        state["runs"][sid] = {"ids": ids, "phase": "intent", "created_at": time.time(), "name": name}
+        self.save(state)  # fsync intent and directory before invoking Claude
         args = ["--bg", "--remote-control", name, "--session-id", sid, "--name", name,
                 "--permission-mode", self.cfg["permission_mode"], "--no-chrome",
                 "--plugin-dir", self.cfg["plugin_root"], "--append-system-prompt", instructions,

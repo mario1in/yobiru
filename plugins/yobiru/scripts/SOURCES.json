@@ -44,11 +44,11 @@
     },
     "scripts/claude_bridge/claude_bridge.py": {
       "source": "claude_bridge.py",
-      "sha256": "ee99d1e44db21d8ed2ead820f98e5a707d3c0bdf4dfbfd3293c8dfed8b9a5ac3"
+      "sha256": "9cb4580b74b63d5d524e425d360d3ec9d31f331c56ad5fa241e9a82275612815"
     },
     "scripts/claude_bridge/CLAUDE_BRIDGE.md": {
       "source": "docs/CLAUDE_BRIDGE.md",
-      "sha256": "42456998e131dc2a5d3f6584ec64d67070178532daabc82e887f7e60173b622e"
+      "sha256": "a66261de24d07f11800bb53da4d4f76dfd86f1092c247302aa70751a0ee63797"
     },
     "scripts/claude_bridge/install_claude_bridge.py": {
       "source": "install_claude_bridge.py",

@@ -41,6 +41,14 @@ assert args[args.index("--permission-mode") + 1] == "manual"
 if mode in ("nonzero", "timeout"): 
     if mode == "timeout": time.sleep(2)
     sys.exit(9)
+if mode.startswith("own_id"):
+    # Newer `claude --bg` ignores --session-id and assigns its own.
+    own = "%08x-0000-4000-8000-000000000000" % (len(state["runs"]) + 0xa9e0e8be)
+    seen = {"id": own[:8], "sessionId": own, "name": args[args.index("--name") + 1],
+            "cwd": str(root) if mode != "own_id_elsewhere" else "/elsewhere", "startedAt": time.time() * 1000}
+    twin = dict(seen, id="bbbbbbbb", sessionId="bbbbbbbb-0000-4000-8000-000000000000")
+    (root / "agents.json").write_text(json.dumps([seen, twin] if mode == "own_id_twice" else [seen]))
+    print("backgrounded " + own[:8]); sys.exit(0)
 (root / "agents.json").write_text(json.dumps([{"id": sid[:8], "sessionId": sid, "status": "idle"}]))
 if mode == "timeout_seen": time.sleep(2)
 if mode == "nonzero_seen": sys.exit(9)
@@ -190,6 +198,59 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual("timeout", result["launch_exit"])
         self.assertEqual("idle", bridge.Bridge(self.cfg).step()["state"])
         self.assertEqual(1, len(self.launches()))
+
+    def test_claude_assigned_session_id_reconciles_by_unique_name(self):
+        self.mode("own_id")
+        result = self.b.step()
+        self.assertEqual("dispatched", result["state"])
+        run = self.b.load_state()["runs"][result["session_id"]]
+        self.assertEqual("name", run["matched_by"])
+        self.assertEqual("Yobiru claude " + self.mid[:8], run["name"])
+        self.assertNotEqual(result["session_id"], run["observed_session_id"])
+        self.assertEqual(run["observed_session_id"][:8], run["background_id"])
+        self.assertEqual("idle", bridge.Bridge(self.cfg).step()["state"])
+        self.assertEqual(1, len(self.launches()))
+
+    def test_claimed_session_is_not_reused_for_the_next_launch(self):
+        self.mode("own_id")
+        first = self.b.step()
+        self.assertEqual("dispatched", first["state"])
+        second_mid = "fedcba9876543210"
+        self.record(second_mid)
+        second = self.b.step()
+        self.assertEqual("dispatched", second["state"])
+        runs = self.b.load_state()["runs"]
+        self.assertNotEqual(runs[first["session_id"]]["observed_session_id"],
+                            runs[second["session_id"]]["observed_session_id"])
+
+    def test_ambiguous_or_foreign_named_session_stays_uncertain(self):
+        for mode in ("own_id_twice", "own_id_elsewhere"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.assertEqual("uncertain", self.b.step()["state"])
+                self.assertEqual("uncertain", bridge.Bridge(self.cfg).step()["state"])
+                self.assertEqual(1, len(self.launches()))
+                # Explicit fixture reset is not a product operation.
+                bridge.atomic_json(self.home / "state.json", bridge.empty_state(self.cfg["installation_id"]))
+                (self.root / "calls.jsonl").unlink()
+                (self.root / "agents.json").unlink()
+
+    def test_legacy_uncertain_run_without_name_reconciles_and_unblocks(self):
+        sid, created = str(uuid.uuid4()), time.time() - 30
+        state = bridge.empty_state(self.cfg["installation_id"])
+        state["runs"][sid] = {"ids": ["4d9243b4beab49e6"], "phase": "uncertain", "created_at": created,
+                              "launch_exit": 0, "reason": "session_not_uniquely_observed"}
+        bridge.atomic_json(self.home / "state.json", state)
+        (self.root / "agents.json").write_text(json.dumps([
+            {"id": "a9e0e8be", "sessionId": "a9e0e8be-0e16-48f5-9780-547b173b06a0", "name": "Yobiru claude 4d9243b4",
+             "cwd": str(self.root), "startedAt": (created + 6) * 1000},
+            {"id": "c0ffee00", "sessionId": "c0ffee00-0000-4000-8000-000000000000", "name": "Yobiru claude 4d9243b4",
+             "cwd": str(self.root), "startedAt": (created - 3600) * 1000}]))
+        self.mode("success")
+        self.assertEqual("dispatched", self.b.step()["state"])
+        run = self.b.load_state()["runs"][sid]
+        self.assertEqual(("dispatched", "a9e0e8be"), (run["phase"], run["background_id"]))
+        self.assertEqual(1, len(self.launches()))  # the pending message launched only after unblocking
 
     def test_crash_after_intent_before_spawn_stays_uncertain(self):
         real = self.b.call

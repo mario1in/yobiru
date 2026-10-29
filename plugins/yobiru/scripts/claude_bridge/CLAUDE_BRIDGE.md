@@ -33,7 +33,7 @@ Use `--config /absolute/path/config.json` for a custom bridge home. `step` perfo
 2. Check local Claude authentication. Auth failures launch nothing and leave the inbox pending.
 3. Persist and fsync a unique session UUID and its exact message IDs **before** invoking Claude.
 4. Start a visible Remote Control session using that UUID, the frozen plugin and local dispatcher instructions.
-5. Reconcile only a unique exact `sessionId` from `claude agents --json --all`. Exit zero or a printed short ID alone is insufficient.
+5. Reconcile a unique exact `sessionId` from `claude agents --json --all`. Some Claude Code versions (for example 2.1.216) ignore `--session-id` for `--bg` and assign their own ID; the bridge then accepts exactly one listed session with the launch's name (`Yobiru AGENT MSGID8`, saved with the intent), the configured workdir and a start time within the launch window that no other run has claimed, and records it as `observed_session_id` with `matched_by: "name"`. Exit zero or a printed short ID alone is insufficient; two candidates stay uncertain.
 
 A crash, timeout, nonzero exit or missing/ambiguous session observation leaves `intent`/`uncertain` ownership. Later cycles query that same UUID; they never issue a second launch. An unresolved intent blocks additional dispatch until reconciled. Corrupt or missing bridge state fails closed, including after restart. There is one writer lock shared by the dispatcher and installer.
 
@@ -45,4 +45,4 @@ Configuration backups contain the old bridge and receiver configuration, **not a
 
 ## Verification boundary
 
-Automated tests use a fake Claude executable and synthetic inbox/ledger records to cover intent-before-launch, interrupted startup, auth failure, duplicate wake, timeout/nonzero outcomes, exact-session reconciliation, expired/final requests, corrupt-state refusal, writer exclusion, read-only status and installer preservation. They do not start a real Claude session, perform paid inference, or verify current Remote Control visibility on a user's account. Validate one authorized harmless request on that account before claiming native acceptance. Local CLI help from Claude Code 2.1.310 supplied the supported flags; future versions may differ.
+Automated tests use a fake Claude executable and synthetic inbox/ledger records to cover intent-before-launch, interrupted startup, auth failure, duplicate wake, timeout/nonzero outcomes, exact-session and name-based reconciliation (including a Claude-assigned ID), expired/final requests, corrupt-state refusal, writer exclusion, read-only status and installer preservation. They do not start a real Claude session, perform paid inference, or verify current Remote Control visibility on a user's account. Validate one authorized harmless request on that account before claiming native acceptance. Local CLI help from Claude Code 2.1.310 supplied the supported flags; future versions may differ.
